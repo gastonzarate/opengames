@@ -22,3 +22,6 @@ venv/
 # Entorno local
 .env
 .DS_Store
+
+# Scratch del flujo de subagentes
+.superpowers/

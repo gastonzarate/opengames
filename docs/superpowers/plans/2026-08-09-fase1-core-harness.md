@@ -845,11 +845,14 @@ from core.model import Modality
 
 @pytest.fixture(autouse=True)
 def load_models():
-    registry.reset()
     import importlib
 
     import models.mock
 
+    # El reset va DESPUÉS del import: en la primera importación del proceso el
+    # módulo ya se registra, y recargarlo sobre un registro no vacío choca con
+    # la guardia de duplicados.
+    registry.reset()
     importlib.reload(models.mock)
     yield
     registry.reset()
@@ -1067,12 +1070,15 @@ from core.job import Job, RunStatus
 
 @pytest.fixture(autouse=True)
 def wiring():
-    registry.reset()
     import importlib
 
     import backends.local
     import models.mock
 
+    # El reset va DESPUÉS del import: en la primera importación del proceso el
+    # módulo ya se registra, y recargarlo sobre un registro no vacío choca con
+    # la guardia de duplicados.
+    registry.reset()
     importlib.reload(models.mock)
     importlib.reload(backends.local)
     yield
@@ -1262,12 +1268,15 @@ from core.runstore import RunStore
 
 @pytest.fixture(autouse=True)
 def wiring():
-    registry.reset()
     import importlib
 
     import backends.local
     import models.mock
 
+    # El reset va DESPUÉS del import: en la primera importación del proceso el
+    # módulo ya se registra, y recargarlo sobre un registro no vacío choca con
+    # la guardia de duplicados.
+    registry.reset()
     importlib.reload(models.mock)
     importlib.reload(backends.local)
     yield
@@ -1539,12 +1548,15 @@ from core.runstore import RunStore
 
 @pytest.fixture(autouse=True)
 def wiring():
-    registry.reset()
     import importlib
 
     import backends.local
     import models.mock
 
+    # El reset va DESPUÉS del import: en la primera importación del proceso el
+    # módulo ya se registra, y recargarlo sobre un registro no vacío choca con
+    # la guardia de duplicados.
+    registry.reset()
     importlib.reload(models.mock)
     importlib.reload(backends.local)
     yield
