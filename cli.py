@@ -4,11 +4,18 @@ import argparse
 import sys
 from pathlib import Path
 
+import yaml
+
 import backends.local  # noqa: F401  registra el backend
 import models.mock  # noqa: F401  registra el modelo
-from core.experiment import load_experiment, run_experiment
-from core.registry import available_backends, available_models
+from core.experiment import InvalidBackendOptions, load_experiment, run_experiment
+from core.registry import UnknownComponent, available_backends, available_models
 from core.runstore import RunStore
+
+# Errores esperables de un config o de un nombre mal escrito: se muestran
+# como un mensaje de una línea, sin traza. Cualquier otra excepción es un bug
+# real y debe seguir propagando con su traceback completo.
+_EXPECTED_ERRORS = (FileNotFoundError, yaml.YAMLError, UnknownComponent, InvalidBackendOptions)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,7 +35,13 @@ def main(argv: list[str] | None = None) -> int:
         print("Backends:", ", ".join(available_backends()))
         return 0
 
-    results = run_experiment(load_experiment(args.config), RunStore(args.runs_dir))
+    try:
+        results = run_experiment(load_experiment(args.config), RunStore(args.runs_dir))
+    except _EXPECTED_ERRORS as exc:
+        mensaje = " ".join(str(exc).split())  # nunca más de una línea
+        print(f"Error: {mensaje}", file=sys.stderr)
+        return 1
+
     for result in results:
         marca = "cache" if result.cached else "nuevo"
         print(f"[{marca}] {result.run_id}")

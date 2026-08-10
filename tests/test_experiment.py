@@ -83,3 +83,47 @@ def test_rerunning_an_experiment_is_fully_cached(tmp_path):
     second = run_experiment(config, store)
 
     assert all(r.cached for r in second)
+
+
+def test_relative_input_paths_resolve_against_the_config_file(tmp_path, monkeypatch):
+    """Las rutas de `inputs` son relativas al YAML, no al cwd desde el que se invoca."""
+    from core.experiment import load_experiment, run_experiment
+
+    exp_dir = tmp_path / "experiment"
+    exp_dir.mkdir()
+    (exp_dir / "cube.png").write_bytes(b"png-bytes")
+    payload = {
+        "name": "relative",
+        "backend": "local",
+        "backend_options": {"vram_gb": 0},
+        "models": ["mock"],
+        "inputs": [{"image": "cube.png"}],  # relativa al directorio del YAML
+        "params": {},
+        "export": {},
+        "seeds": [1],
+    }
+    config_path = exp_dir / "exp.yaml"
+    config_path.write_text(yaml.safe_dump(payload))
+
+    # cwd distinto del directorio del config: si la resolución usara el cwd
+    # en lugar del YAML, "cube.png" no existiría acá y explotaría con
+    # FileNotFoundError al copiar el input.
+    monkeypatch.chdir(tmp_path)
+
+    config = load_experiment(config_path)
+    store = RunStore(tmp_path / "runs")
+    results = run_experiment(config, store)
+
+    assert len(results) == 1
+    assert not results[0].cached
+
+
+def test_invalid_backend_options_raise_a_readable_error(tmp_path):
+    """Un typo en `backend_options` da un mensaje con contexto, no un TypeError crudo."""
+    from core.experiment import InvalidBackendOptions, load_experiment, run_experiment
+
+    store = RunStore(tmp_path / "runs")
+    config = load_experiment(_write_config(tmp_path, backend_options={"vram_g": 0}))
+
+    with pytest.raises(InvalidBackendOptions, match="vram_g"):
+        run_experiment(config, store)

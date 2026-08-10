@@ -8,9 +8,13 @@ import yaml
 from pydantic import BaseModel, Field
 
 from core.job import Job
-from core.registry import UnknownComponent, available_backends, get_backend, get_model
+from core.registry import UnknownComponent, available_backends, get_backend_class, get_model
 from core.runner import RunResult, execute
 from core.runstore import RunStore
+
+
+class InvalidBackendOptions(ValueError):
+    """`backend_options` no coincide con el constructor del backend elegido."""
 
 
 class ExperimentConfig(BaseModel):
@@ -24,8 +28,29 @@ class ExperimentConfig(BaseModel):
     seeds: list[int] = Field(default_factory=lambda: [42])
 
 
+def _resolve_relative_inputs(raw: Any, base_dir: Path) -> None:
+    """Reescribe in-place las rutas relativas de `inputs` contra `base_dir`.
+
+    La convención es la de docker-compose: las rutas de un config se
+    interpretan relativas al archivo que las declara, no al directorio
+    desde el que se invoca el CLI. Las rutas ya absolutas quedan intactas.
+    """
+    if not isinstance(raw, dict):
+        return
+    for entry in raw.get("inputs") or []:
+        if not isinstance(entry, dict):
+            continue
+        for key, value in entry.items():
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                entry[key] = str(base_dir / candidate)
+
+
 def load_experiment(path: Path) -> ExperimentConfig:
-    config = ExperimentConfig.model_validate(yaml.safe_load(Path(path).read_text()))
+    path = Path(path)
+    raw = yaml.safe_load(path.read_text())
+    _resolve_relative_inputs(raw, path.resolve().parent)
+    config = ExperimentConfig.model_validate(raw)
     for name in config.models:  # falla temprano si el nombre no existe
         get_model(name)
     # Se comprueba por membresía, no instanciando: un backend puede exigir
@@ -50,6 +75,12 @@ def expand_jobs(config: ExperimentConfig) -> list[Job]:
 
 
 def run_experiment(config: ExperimentConfig, store: RunStore) -> list[RunResult]:
-    backend_cls = type(get_backend(config.backend))
-    backend = backend_cls(**config.backend_options)
+    backend_cls = get_backend_class(config.backend)
+    try:
+        backend = backend_cls(**config.backend_options)
+    except TypeError as exc:
+        raise InvalidBackendOptions(
+            f"backend_options inválidas para el backend '{config.backend}' del "
+            f"experimento '{config.name}': {exc}"
+        ) from exc
     return [execute(job, backend, store) for job in expand_jobs(config)]

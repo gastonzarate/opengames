@@ -5,7 +5,7 @@ backend_options:
 models:
   - mock
 inputs:
-  - image: assets/examples/cube.png
+  - image: ../assets/examples/cube.png
 params: {}
 export: {}
 seeds:

@@ -33,11 +33,15 @@ def register_backend(name: str) -> Callable[[type[T]], type[T]]:
     return _register(_BACKENDS, "backend", name)
 
 
-def _get(store: dict[str, type], kind: str, name: str):
+def _get_class(store: dict[str, type], kind: str, name: str) -> type:
     if name not in store:
         known = ", ".join(sorted(store)) or "ninguno"
         raise UnknownComponent(f"No existe el {kind} '{name}'. Registrados: {known}")
-    return store[name]()
+    return store[name]
+
+
+def _get(store: dict[str, type], kind: str, name: str):
+    return _get_class(store, kind, name)()
 
 
 def get_model(name: str) -> ModelAdapter:
@@ -46,6 +50,17 @@ def get_model(name: str) -> ModelAdapter:
 
 def get_backend(name: str) -> Backend:
     return _get(_BACKENDS, "backend", name)
+
+
+def get_backend_class(name: str) -> type[Backend]:
+    """Como `get_backend`, pero sin instanciar.
+
+    Sirve para los llamadores que necesitan la clase para construirla ellos
+    mismos con argumentos propios (p. ej. `backend_options` de un experimento)
+    sin pagar el costo de una instanciación descartable con el constructor
+    por defecto, que explotaría contra un backend que exige argumentos.
+    """
+    return _get_class(_BACKENDS, "backend", name)
 
 
 def available_models() -> list[str]:
