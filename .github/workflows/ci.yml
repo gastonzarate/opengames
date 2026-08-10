@@ -20,5 +20,25 @@ jobs:
       - name: Humo de punta a punta
         run: |
           python cli.py list
-          python cli.py run experiments/smoke.yaml --runs-dir "$RUNNER_TEMP/runs"
-          python cli.py run experiments/smoke.yaml --runs-dir "$RUNNER_TEMP/runs"
+
+          # Primera corrida: debe ser nueva, no desde caché
+          echo "=== Primera corrida ==="
+          OUTPUT1=$(python cli.py run experiments/smoke.yaml --runs-dir "$RUNNER_TEMP/runs")
+          echo "$OUTPUT1"
+          if ! echo "$OUTPUT1" | grep -q '\[nuevo\]'; then
+            echo "FAIL: Primera corrida debe marcar [nuevo]"
+            exit 1
+          fi
+
+          # Segunda corrida: debe pegar en caché
+          echo "=== Segunda corrida ==="
+          OUTPUT2=$(python cli.py run experiments/smoke.yaml --runs-dir "$RUNNER_TEMP/runs")
+          echo "$OUTPUT2"
+          if ! echo "$OUTPUT2" | grep -q '\[cache\]'; then
+            echo "FAIL: Segunda corrida debe marcar [cache]"
+            exit 1
+          fi
+          if ! echo "$OUTPUT2" | grep -q 'desde caché'; then
+            echo "FAIL: Resumen debe indicar 'desde caché'"
+            exit 1
+          fi
