@@ -1,0 +1,12 @@
+name: smoke
+backend: local
+backend_options:
+  vram_gb: 0
+models:
+  - mock
+inputs:
+  - image: assets/examples/cube.png
+params: {}
+export: {}
+seeds:
+  - 42
