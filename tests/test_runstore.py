@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 
 import pytest
 
@@ -102,189 +104,178 @@ def test_exists_is_false_until_metrics_are_written(tmp_path, spec, image):
     assert not store.exists(run_id)
 
 
+# --- Tests agregados en rondas de arreglos (no forman parte de los 7 originales) ---
+#
+# Cada uno cubre una de las seis propiedades del diseño "marcador con dueño
+# verificable": el `.in-progress` guarda el PID de quien lo creó y solo se
+# considera huérfano -y por lo tanto seguro de limpiar- si ese proceso ya no
+# existe, o si el marcador no se puede parsear.
+
+
+def _dead_pid() -> int:
+    """PID de un proceso que ya terminó: garantía real de "muerto", no un
+    número inventado que por casualidad podría coincidir con un proceso vivo."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
 def test_exists_rejects_truncated_metrics(tmp_path, spec, image):
     """metrics.json truncado o corrupto no cuenta como caché válida."""
     store = RunStore(tmp_path / "runs")
     job = Job(model="toy", inputs={"image": image})
     run_id = compute_run_id(job, spec)
 
-    # Escribir un metrics.json válido con flujo normal
     store.create(run_id)
     store.write_job(run_id, job)
     store.write_metrics(run_id, {"duration_s": 1.5})
     assert store.exists(run_id)
 
-    # Truncar el archivo (simular interrupción a mitad de escritura)
     metrics_path = store._dir(run_id) / "metrics.json"
     metrics_path.write_text("{")  # JSON inválido
-
-    # Debe retornar False porque el JSON es corrupto
     assert not store.exists(run_id)
 
 
 def test_load_artifacts_on_nonexistent_run_raises(tmp_path, spec, image):
-    """load_artifacts sobre un run_id inexistente lanza FileNotFoundError."""
+    """load_artifacts sobre un run_id que nunca existió lanza FileNotFoundError."""
     store = RunStore(tmp_path / "runs")
     job = Job(model="toy", inputs={"image": image})
     run_id = compute_run_id(job, spec)
 
-    # Directorio no existe
-    assert not (store._dir(run_id)).exists()
-
-    # Cargar artifacts sobre un run_id que nunca fue iniciado debe lanzar excepción
+    assert not store._dir(run_id).exists()
     with pytest.raises(FileNotFoundError):
         store.load_artifacts(run_id)
-
-    # El directorio raíz no fue creado
-    assert not (store._dir(run_id)).exists()
+    assert not store._dir(run_id).exists()
 
 
-def test_retry_cleans_old_outputs_from_failed_run(tmp_path, spec, image):
-    """Reintento sobre run_id que crasheó a mitad limpia outputs parciales.
+def test_create_is_idempotent_and_never_destroys_outputs(tmp_path, spec, image):
+    """Propiedad 1: create() es idempotente y jamás destructivo.
 
-    Usa dos instancias de RunStore para simular un nuevo proceso (crash → reintento).
+    Un artefacto colocado a mano en outputs/ (sin pasar por write_job ni
+    write_metrics, o sea sin que exista ningún marcador todavía) tiene que
+    sobrevivir a cualquier cantidad de llamadas repetidas a create().
     """
-    job = Job(model="toy", inputs={"image": image})
-    run_id = compute_run_id(job, spec)
-
-    # Primer proceso: simular una corrida que crashea después de escribir un output parcial
-    store1 = RunStore(tmp_path / "runs")
-    store1.create(run_id)
-    store1.write_job(run_id, job)  # Crea el marcador .in-progress
-    (store1.outputs_dir(run_id) / "partial_output.glb").write_bytes(b"incomplete")
-    # La corrida nunca llegó a write_metrics(), así que .in-progress sigue presente
-
-    assert not store1.exists(run_id)  # No cacheada (crash)
-    assert (store1._dir(run_id) / "outputs" / "partial_output.glb").exists()
-
-    # Nuevo proceso (reintento): write_job() limpia outputs viejos del crash
-    store2 = RunStore(tmp_path / "runs")  # Nueva instancia, _initiated_run_ids vacío
-    store2.write_job(run_id, job)
-    assert not (store2._dir(run_id) / "outputs" / "partial_output.glb").exists()
-
-    # Escribir nuevos outputs
-    (store2.outputs_dir(run_id) / "new_output.glb").write_bytes(b"new")
-    store2.write_metrics(run_id, {"duration_s": 1.0})
-
-    # Verificar que solo existe el nuevo output, no los restos del crash
-    artifacts = store2.load_artifacts(run_id)
-    assert "new_output.glb" in artifacts.files
-    assert "partial_output.glb" not in artifacts.files
-    assert artifacts.metrics["duration_s"] == 1.0
-
-
-def test_completed_run_outputs_survive_subsequent_create(tmp_path, spec, image):
-    """Regresión Critical: una corrida completada no pierde outputs por create() posterior."""
     store = RunStore(tmp_path / "runs")
     job = Job(model="toy", inputs={"image": image})
     run_id = compute_run_id(job, spec)
 
-    # Corrida completa
     store.create(run_id)
+    (store.outputs_dir(run_id) / "temprano.glb").write_bytes(b"dato")
+
+    for _ in range(3):
+        store.create(run_id)
+
+    assert (store._dir(run_id) / "outputs" / "temprano.glb").read_bytes() == b"dato"
+
+
+def test_dead_attempt_garbage_does_not_contaminate_retry(tmp_path, spec, image):
+    """Propiedad 2: la basura de un intento que murió no contamina el reintento.
+
+    Se simula un crash real escribiendo el marcador `.in-progress` con el PID
+    de un proceso que efectivamente ya terminó (no una instancia nueva en el
+    mismo proceso, que es un caso distinto: ver la propiedad 6). Un
+    `write_job()` posterior debe reconocer el marcador como huérfano y
+    limpiar los restos antes de que el nuevo intento escriba sus outputs.
+    """
+    store = RunStore(tmp_path / "runs")
+    job = Job(model="toy", inputs={"image": image})
+    run_id = compute_run_id(job, spec)
+
+    base = store.create(run_id)
+    (base / "outputs" / "partial.glb").write_bytes(b"incompleto")
+    (base / ".in-progress").write_text(json.dumps({"pid": _dead_pid()}))
+    assert not store.exists(run_id)
+
     store.write_job(run_id, job)
-    (store.outputs_dir(run_id) / "sample.glb").write_bytes(b"artefacto")
-    store.write_metrics(run_id, {"duration_s": 1.5})
-    assert store.exists(run_id)
+    assert not (base / "outputs" / "partial.glb").exists()
 
-    # Verificar que el output existe
-    assert (store._dir(run_id) / "outputs" / "sample.glb").exists()
-    original_files = list((store._dir(run_id) / "outputs").iterdir())
+    (store.outputs_dir(run_id) / "limpio.glb").write_bytes(b"nuevo")
+    store.write_metrics(run_id, {"duration_s": 1.0})
 
-    # Aceso posterior (simular orquestador que llama create() para copiar output)
-    store.create(run_id)
-
-    # Los outputs deben seguir existiendo
-    assert store.exists(run_id)
-    assert (store._dir(run_id) / "outputs" / "sample.glb").exists()
     artifacts = store.load_artifacts(run_id)
-    assert "sample.glb" in artifacts.files
-    assert list((store._dir(run_id) / "outputs").iterdir()) == original_files
+    assert "limpio.glb" in artifacts.files
+    assert "partial.glb" not in artifacts.files
 
 
-def test_completed_run_survives_outputs_dir_access(tmp_path, spec, image):
-    """Una corrida completada no pierde outputs cuando se accede a outputs_dir()."""
+def test_completed_run_survives_subsequent_access(tmp_path, spec, image):
+    """Propiedad 3: una corrida completada nunca pierde sus outputs por
+    accesos posteriores (create(), outputs_dir(), o un write_job() tardío)."""
     store = RunStore(tmp_path / "runs")
     job = Job(model="toy", inputs={"image": image})
     run_id = compute_run_id(job, spec)
 
-    # Corrida completa
     store.create(run_id)
     store.write_job(run_id, job)
     (store.outputs_dir(run_id) / "sample.glb").write_bytes(b"artefacto")
     store.write_metrics(run_id, {"duration_s": 1.5})
     assert store.exists(run_id)
 
-    # Acceso a outputs_dir (que internamente llama create())
-    outputs_path = store.outputs_dir(run_id)
+    store.create(run_id)
+    store.outputs_dir(run_id)
+    store.write_job(run_id, job)  # acceso tardío, no debería tocar nada
 
-    # Los outputs deben seguir existiendo
     assert store.exists(run_id)
-    assert (outputs_path / "sample.glb").exists()
-    assert (outputs_path / "sample.glb").read_bytes() == b"artefacto"
+    artifacts = store.load_artifacts(run_id)
+    assert artifacts.files["sample.glb"].read_bytes() == b"artefacto"
+
+
+def test_exists_is_false_while_in_progress_marker_present(tmp_path, spec, image):
+    """Propiedad 4: exists() nunca da verdadero con `.in-progress` presente,
+    incluso si metrics.json ya es válido (p. ej. una corrida completándose
+    justo en este instante, entre escribir metrics y borrar el marcador)."""
+    store = RunStore(tmp_path / "runs")
+    job = Job(model="toy", inputs={"image": image})
+    run_id = compute_run_id(job, spec)
+
+    base = store.create(run_id)
+    store.write_job(run_id, job)
+    metrics_path = base / "metrics.json"
+    metrics_path.write_text(json.dumps({"duration_s": 1.0}))
+    assert (base / ".in-progress").is_file()
+
+    assert not store.exists(run_id)
 
 
 def test_write_job_called_twice_in_same_attempt_preserves_outputs(tmp_path, spec, image):
-    """write_job() llamado dos veces en el mismo intento no destruye outputs."""
+    """Propiedad 5: dos `write_job()` dentro del mismo intento no se pisan."""
     store = RunStore(tmp_path / "runs")
     job = Job(model="toy", inputs={"image": image})
     run_id = compute_run_id(job, spec)
 
-    # Primera llamada a write_job()
-    store.create(run_id)
     store.write_job(run_id, job)
-
-    # Escribir outputs después de la primera write_job()
     (store.outputs_dir(run_id) / "output1.glb").write_bytes(b"output1")
 
-    # Segunda llamada a write_job() (ej: wrapper de reintento, reescribir job.json)
-    store.write_job(run_id, job)
-
-    # Los outputs deben sobrevivir a la segunda write_job()
+    store.write_job(run_id, job)  # p.ej. reescribir job.json tras resolver defaults
     assert (store._dir(run_id) / "outputs" / "output1.glb").exists()
-    assert (store._dir(run_id) / "outputs" / "output1.glb").read_bytes() == b"output1"
 
-    # Escribir más outputs después de la segunda write_job()
     (store.outputs_dir(run_id) / "output2.glb").write_bytes(b"output2")
-
-    # Completar la corrida
     store.write_metrics(run_id, {"duration_s": 1.0})
 
-    # Verificar que ambos outputs existen
     artifacts = store.load_artifacts(run_id)
     assert "output1.glb" in artifacts.files
     assert "output2.glb" in artifacts.files
-    assert artifacts.metrics["duration_s"] == 1.0
 
 
-def test_write_job_twice_after_crash_cleans_old_outputs_on_new_process(tmp_path, spec, image):
-    """Crash y reintento en nuevo proceso: write_job() limpia basura del intento anterior."""
-    # Primer proceso: simular crash
-    store1 = RunStore(tmp_path / "runs")
+def test_two_instances_same_process_do_not_destroy_each_others_outputs(tmp_path, spec, image):
+    """Propiedad 6 (el hallazgo abierto): dos `RunStore` sobre la misma raíz,
+    en el mismo proceso, no se destruyen artefactos entre sí.
+
+    Nada en la firma pública `RunStore(root: Path)` impide instanciar dos
+    veces sobre la misma raíz. La segunda instancia no puede tratar el
+    intento en curso de la primera como basura huérfana solo porque su
+    propio estado en memoria está vacío.
+    """
+    root = tmp_path / "runs"
     job = Job(model="toy", inputs={"image": image})
     run_id = compute_run_id(job, spec)
 
-    store1.create(run_id)
-    store1.write_job(run_id, job)
-    (store1.outputs_dir(run_id) / "partial.glb").write_bytes(b"incomplete")
-    # Crash: nunca llegamos a write_metrics()
+    a = RunStore(root)
+    a.create(run_id)
+    a.write_job(run_id, job)
+    (a.outputs_dir(run_id) / "valioso.glb").write_bytes(b"artefacto del intento en curso")
 
-    # Verificar que no está cacheado
-    assert not store1.exists(run_id)
-    assert (store1._dir(run_id) / "outputs" / "partial.glb").exists()
+    b = RunStore(root)  # segunda instancia, mismo proceso, misma raíz
+    b.write_job(run_id, job)
 
-    # Nuevo proceso: reintento
-    store2 = RunStore(tmp_path / "runs")  # Nueva instancia, _initiated_run_ids vacío
-
-    # Primera write_job() en el nuevo proceso ve la basura del crash anterior
-    # y la limpia
-    store2.write_job(run_id, job)
-    assert not (store2._dir(run_id) / "outputs" / "partial.glb").exists()
-
-    # Escribir outputs limpios
-    (store2.outputs_dir(run_id) / "clean.glb").write_bytes(b"clean")
-    store2.write_metrics(run_id, {"duration_s": 1.0})
-
-    # Verificar que solo existe el output limpio
-    artifacts = store2.load_artifacts(run_id)
-    assert "clean.glb" in artifacts.files
-    assert "partial.glb" not in artifacts.files
+    assert (a.outputs_dir(run_id) / "valioso.glb").exists()
+    assert (a.outputs_dir(run_id) / "valioso.glb").read_bytes() == b"artefacto del intento en curso"

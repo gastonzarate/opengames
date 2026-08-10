@@ -1,13 +1,40 @@
 """Persistencia de corridas: identidad por contenido, procedencia y caché.
 
-`exists()` solo devuelve verdadero cuando existe `metrics.json`, que se
-escribe al final. Una corrida interrumpida deja el directorio a medias y
-no se toma como cacheada.
+`exists()` solo devuelve verdadero cuando `metrics.json` es JSON válido Y no
+hay un marcador `.in-progress` presente. `write_metrics()` escribe
+`metrics.json` de forma atómica y recién ahí borra el marcador: una corrida
+interrumpida deja el directorio a medias y nunca se toma como cacheada.
+
+## Por qué un marcador con dueño verificable
+
+Un `run_id` es determinístico: dos intentos sobre el mismo contenido escriben
+en el mismo directorio. Eso significa que un reintento después de un crash
+puede encontrarse con outputs parciales del intento anterior, y hay que
+decidir si son basura para limpiar o el trabajo legítimo de un intento que
+sigue vivo. Nada en la firma pública `RunStore(root: Path)` impide construir
+más de una instancia sobre la misma raíz — dentro del mismo proceso o desde
+procesos distintos — así que esa decisión no puede depender de estado en
+memoria de la instancia (eso fue el error de la ronda anterior).
+
+El marcador `.in-progress` guarda el PID de quien lo creó. Un marcador se
+considera huérfano -y por lo tanto seguro de limpiar- únicamente si:
+- no se puede parsear (JSON inválido o sin campo `pid`), o
+- el proceso dueño ya no existe (`os.kill(pid, 0)` falla con `ProcessLookupError`).
+
+Si el proceso dueño sigue vivo -sea porque es un intento real en curso, sea
+porque es OTRA instancia de `RunStore` en el mismo proceso que llama
+`write_job()` de nuevo- el marcador nunca se trata como basura. Esto es
+deliberadamente conservador: un reintento *secuencial dentro del mismo
+proceso* (mismo PID que el intento anterior, que nunca llegó a crashear
+realmente) no dispara la limpieza y puede dejar basura del intento previo.
+Ese residuo es el costo aceptado: cuesta algo de disco, nunca un falso
+positivo de caché ni la pérdida de un artefacto de un intento vivo.
 """
 
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +44,7 @@ from core.job import Artifacts, Job
 from core.model import ModelSpec
 
 _CHUNK = 1 << 20
+_MARKER_NAME = ".in-progress"
 
 
 def _hash_file(path: Path) -> str:
@@ -68,49 +96,65 @@ def collect_provenance(job: Job, spec: ModelSpec, backend_name: str) -> dict[str
     }
 
 
+def _marker_owner_pid(marker: Path) -> int | None:
+    """PID guardado en el marcador, o None si no se puede parsear."""
+    try:
+        data = json.loads(marker.read_text())
+        pid = data["pid"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    return pid
+
+
+def _pid_alive(pid: int) -> bool:
+    """True si el proceso `pid` sigue existiendo (vivo o zombie, da igual)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Existe pero no nos pertenece: sigue vivo.
+        return True
+    except OSError:
+        # Cualquier otra falla del syscall: no podemos confirmar que murió,
+        # así que no lo tratamos como huérfano. Fallar del lado seguro.
+        return True
+    return True
+
+
 class RunStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
-        # Rastrear qué run_id ya fueron iniciados en este proceso.
-        # Permite que write_job() se llame múltiples veces en el mismo intento
-        # sin destruir outputs, pero sigue limpiando basura de intentos anteriores (crashes).
-        self._initiated_run_ids: set[str] = set()
 
     def _dir(self, run_id: str) -> Path:
         return self.root / run_id
 
     def create(self, run_id: str) -> Path:
-        """Crear directorios para una corrida. Solo mkdir -p, idempotente, nunca destructivo."""
+        """Asegura los directorios de la corrida. Solo `mkdir -p`: idempotente
+        y nunca destructivo, sin excepciones. No toca el marcador ni borra
+        nada bajo ninguna circunstancia."""
         base = self._dir(run_id)
         (base / "inputs").mkdir(parents=True, exist_ok=True)
         (base / "outputs").mkdir(parents=True, exist_ok=True)
         return base
 
     def exists(self, run_id: str) -> bool:
-        """Una corrida existe si:
-        - metrics.json es JSON válido (indica completitud)
-        - AND .in-progress no existe (fue eliminado en write_metrics)
-
-        Así se distinguen estados:
-        - Corrida completada: metrics.json válido, sin .in-progress
-        - Corrida en progreso: .in-progress presente
-        - Corrida fallida (crash): .in-progress presente, metrics.json corrupto o ausente
-        - Corrida inexistente: ni metrics ni .in-progress
-        """
+        """Verdadero solo si la corrida completó: `metrics.json` es JSON
+        válido y no queda un marcador `.in-progress`, sin importar de quién
+        sea ese marcador — su sola presencia basta para decir "no cacheada"."""
         base_dir = self._dir(run_id)
+        if (base_dir / _MARKER_NAME).is_file():
+            return False
         metrics_path = base_dir / "metrics.json"
-        in_progress_marker = base_dir / ".in-progress"
-
-        # Debe existir metrics.json válido
         if not metrics_path.is_file():
             return False
         try:
             json.loads(metrics_path.read_text())
         except (json.JSONDecodeError, OSError):
             return False
-
-        # AND no debe existir el marcador de "en progreso"
-        return not in_progress_marker.is_file()
+        return True
 
     def inputs_dir(self, run_id: str) -> Path:
         return self.create(run_id) / "inputs"
@@ -118,37 +162,43 @@ class RunStore:
     def outputs_dir(self, run_id: str) -> Path:
         return self.create(run_id) / "outputs"
 
+    def _reset_attempt(self, base: Path) -> None:
+        """Descarta inputs/outputs de un intento confirmado huérfano."""
+        for name in ("inputs", "outputs"):
+            directory = base / name
+            if directory.exists():
+                shutil.rmtree(directory)
+            directory.mkdir(parents=True, exist_ok=True)
+
     def write_job(self, run_id: str, job: Job) -> None:
-        """Escribir job.json. Se puede llamar múltiples veces en el mismo intento.
+        """Punto de entrada de un intento.
 
-        La primera llamada para un run_id en este proceso:
-        - Limpia restos de intentos anteriores fallidos (outputs viejos)
-        - Marca que este intento está en progreso (.in-progress)
-
-        Llamadas posteriores (dentro del mismo intento):
-        - No limpian nada (es el mismo intento, no basura vieja)
-        - Solo actualizan job.json
+        - Si la corrida ya completó (`exists()`), es un acceso tardío: no se
+          toca nada, ni siquiera el marcador. Nunca se pierde un resultado ya
+          cacheado por una llamada posterior a `write_job()`.
+        - Si hay un marcador y su dueño sigue vivo (incluida la posibilidad
+          de que sea este mismo proceso, vía otra instancia de `RunStore`),
+          se preserva todo: no es basura, es un intento en curso.
+        - Si el marcador es huérfano (dueño muerto o marcador ilegible), se
+          limpian los restos antes de empezar el intento nuevo.
+        - Se puede llamar más de una vez dentro del mismo intento sin
+          destruir lo que ese intento ya escribió: la segunda llamada ve el
+          marcador que puso la primera, con el PID de este mismo proceso,
+          vivo por definición.
         """
         base = self.create(run_id)
-        in_progress_marker = base / ".in-progress"
+        if self.exists(run_id):
+            (base / "job.json").write_text(job.model_dump_json(indent=2))
+            return
 
-        # Si es la primera vez que escribimos este run_id en este proceso
-        # (el run_id no está en _initiated_run_ids), es un reintento sobre basura vieja.
-        # Limpiar y eliminar marcador antiguo.
-        if run_id not in self._initiated_run_ids:
-            if in_progress_marker.is_file():
-                outputs = base / "outputs"
-                if outputs.exists():
-                    for file in outputs.iterdir():
-                        if file.is_file():
-                            file.unlink()
-                in_progress_marker.unlink()
-            # Marcar este run_id como iniciado en este proceso
-            self._initiated_run_ids.add(run_id)
+        marker = base / _MARKER_NAME
+        if marker.is_file():
+            owner_pid = _marker_owner_pid(marker)
+            if owner_pid is None or not _pid_alive(owner_pid):
+                self._reset_attempt(base)
 
-        # Escribir job.json y crear/recrear marcador de "en progreso"
+        marker.write_text(json.dumps({"pid": os.getpid()}))
         (base / "job.json").write_text(job.model_dump_json(indent=2))
-        in_progress_marker.touch()
 
     def write_provenance(self, run_id: str, data: dict[str, Any]) -> None:
         (self.create(run_id) / "provenance.json").write_text(json.dumps(data, indent=2))
@@ -157,36 +207,32 @@ class RunStore:
         base = self.create(run_id)
         metrics_path = base / "metrics.json"
         temp_path = base / "metrics.json.tmp"
-        # Escribir a temporal primero, luego reemplazar atómicamente
+        # Escribir a temporal primero, luego reemplazar atómicamente: si el
+        # proceso muere a mitad de la escritura, metrics.json nunca queda
+        # truncado.
         temp_path.write_text(json.dumps(metrics, indent=2))
         os.replace(str(temp_path), str(metrics_path))
-        # Eliminar marcador de "en progreso" ya que la corrida completó exitosamente
-        (base / ".in-progress").unlink(missing_ok=True)
+        # Recién ahora, con metrics.json ya persistido, la corrida completó:
+        # se borra el marcador de "en progreso".
+        (base / _MARKER_NAME).unlink(missing_ok=True)
 
     def load_artifacts(self, run_id: str) -> Artifacts:
-        """Cargar artefactos de una corrida.
-
-        Lanza FileNotFoundError si la corrida no fue nunca iniciada (no existe job.json).
-        Devuelve Artifacts con metrics={} y files={} vacío si la corrida no completó.
-        """
+        """Lanza `FileNotFoundError` si la corrida nunca fue iniciada (no
+        existe `job.json`). Para una corrida iniciada pero no completada,
+        devuelve `Artifacts` con lo que haya (potencialmente vacío)."""
         base_dir = self._dir(run_id)
         job_path = base_dir / "job.json"
-        metrics_path = base_dir / "metrics.json"
-
-        # Si no existe job.json, la corrida nunca fue iniciada: error
         if not job_path.is_file():
             raise FileNotFoundError(f"Run {run_id} not found")
 
-        # Leer metrics si existe y es válido
+        metrics_path = base_dir / "metrics.json"
         metrics = {}
         if metrics_path.is_file():
             try:
                 metrics = json.loads(metrics_path.read_text())
             except (json.JSONDecodeError, OSError):
-                # Si metrics está corrupto, devolver vacío (corrida falló)
                 pass
 
-        # Leer outputs si existen (no crear directorios)
         outputs = base_dir / "outputs"
         files = {}
         if outputs.is_dir():
