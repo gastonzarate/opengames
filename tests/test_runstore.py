@@ -100,3 +100,67 @@ def test_exists_is_false_until_metrics_are_written(tmp_path, spec, image):
     store.create(run_id)
     store.write_job(run_id, job)
     assert not store.exists(run_id)
+
+
+def test_exists_rejects_truncated_metrics(tmp_path, spec, image):
+    """metrics.json truncado o corrupto no cuenta como caché válida."""
+    store = RunStore(tmp_path / "runs")
+    job = Job(model="toy", inputs={"image": image})
+    run_id = compute_run_id(job, spec)
+
+    # Escribir un metrics.json válido
+    store.create(run_id)
+    store.write_metrics(run_id, {"duration_s": 1.5})
+    assert store.exists(run_id)
+
+    # Truncar el archivo (simular interrupción a mitad de escritura)
+    metrics_path = store._dir(run_id) / "metrics.json"
+    metrics_path.write_text("{")  # JSON inválido
+
+    # Debe retornar False porque el JSON es corrupto
+    assert not store.exists(run_id)
+
+
+def test_load_artifacts_on_nonexistent_run_returns_empty(tmp_path, spec, image):
+    """load_artifacts sobre un run_id inexistente retorna Artifacts vacío sin crear dirs."""
+    store = RunStore(tmp_path / "runs")
+    job = Job(model="toy", inputs={"image": image})
+    run_id = compute_run_id(job, spec)
+
+    # Directorio no existe
+    assert not (store._dir(run_id)).exists()
+
+    # Cargar artifacts no debe crear directorios
+    artifacts = store.load_artifacts(run_id)
+
+    # El directorio raíz no debe haber sido creado
+    assert not (store._dir(run_id)).exists()
+    assert artifacts.metrics == {}
+    assert artifacts.files == {}
+
+
+def test_retry_cleans_old_outputs(tmp_path, spec, image):
+    """Reintento sobre run_id con corrida exitosa anterior no arrastra outputs viejos."""
+    store = RunStore(tmp_path / "runs")
+    job = Job(model="toy", inputs={"image": image})
+    run_id = compute_run_id(job, spec)
+
+    # Primera corrida: escribir outputs y métricas
+    store.create(run_id)
+    (store.outputs_dir(run_id) / "old_output.glb").write_bytes(b"old")
+    store.write_metrics(run_id, {"duration_s": 1.0})
+    assert store.exists(run_id)
+
+    # Reintento: create debe limpiar outputs viejos (porque ya existe metrics válido)
+    store.create(run_id)
+    assert not (store._dir(run_id) / "outputs" / "old_output.glb").exists()
+
+    # Escribir nuevos outputs
+    (store.outputs_dir(run_id) / "new_output.glb").write_bytes(b"new")
+    store.write_metrics(run_id, {"duration_s": 2.0})
+
+    # Verificar que solo existe el nuevo output
+    artifacts = store.load_artifacts(run_id)
+    assert "new_output.glb" in artifacts.files
+    assert "old_output.glb" not in artifacts.files
+    assert artifacts.metrics["duration_s"] == 2.0

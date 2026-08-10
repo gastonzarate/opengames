@@ -7,6 +7,7 @@ no se toma como cacheada.
 
 import hashlib
 import json
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,12 +77,34 @@ class RunStore:
 
     def create(self, run_id: str) -> Path:
         base = self._dir(run_id)
+        in_progress_marker = base / ".in-progress"
+
+        # Limpiar outputs de corridas anteriores (tanto fallidas como exitosas) en reintentos:
+        # Si existe outputs pero no existe .in-progress, es un reintento y hay archivos
+        # viejos que deben descartarse antes de la nueva corrida.
+        outputs = base / "outputs"
+        if outputs.exists() and not in_progress_marker.is_file():
+            for file in outputs.iterdir():
+                if file.is_file():
+                    file.unlink()
+
+        # Crear directorio y marcador de "en progreso"
         (base / "inputs").mkdir(parents=True, exist_ok=True)
-        (base / "outputs").mkdir(parents=True, exist_ok=True)
+        outputs.mkdir(parents=True, exist_ok=True)
+        if not in_progress_marker.is_file():
+            in_progress_marker.touch()
+
         return base
 
     def exists(self, run_id: str) -> bool:
-        return (self._dir(run_id) / "metrics.json").is_file()
+        metrics_path = self._dir(run_id) / "metrics.json"
+        if not metrics_path.is_file():
+            return False
+        try:
+            json.loads(metrics_path.read_text())
+            return True
+        except (json.JSONDecodeError, OSError):
+            return False
 
     def inputs_dir(self, run_id: str) -> Path:
         return self.create(run_id) / "inputs"
@@ -96,11 +119,22 @@ class RunStore:
         (self.create(run_id) / "provenance.json").write_text(json.dumps(data, indent=2))
 
     def write_metrics(self, run_id: str, metrics: dict[str, float]) -> None:
-        (self.create(run_id) / "metrics.json").write_text(json.dumps(metrics, indent=2))
+        base = self.create(run_id)
+        metrics_path = base / "metrics.json"
+        temp_path = base / "metrics.json.tmp"
+        # Escribir a temporal primero, luego reemplazar atómicamente
+        temp_path.write_text(json.dumps(metrics, indent=2))
+        os.replace(str(temp_path), str(metrics_path))
+        # Eliminar marcador de "en progreso" ya que la corrida completó exitosamente
+        (base / ".in-progress").unlink(missing_ok=True)
 
     def load_artifacts(self, run_id: str) -> Artifacts:
-        metrics_path = self._dir(run_id) / "metrics.json"
+        base_dir = self._dir(run_id)
+        metrics_path = base_dir / "metrics.json"
         metrics = json.loads(metrics_path.read_text()) if metrics_path.is_file() else {}
-        outputs = self.outputs_dir(run_id)
-        files = {path.name: path for path in sorted(outputs.iterdir()) if path.is_file()}
+        # No llamar a outputs_dir() para evitar crear directorios como efecto secundario
+        outputs = base_dir / "outputs"
+        files = {}
+        if outputs.is_dir():
+            files = {path.name: path for path in sorted(outputs.iterdir()) if path.is_file()}
         return Artifacts(files=files, metrics=metrics)
