@@ -71,6 +71,10 @@ def collect_provenance(job: Job, spec: ModelSpec, backend_name: str) -> dict[str
 class RunStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
+        # Rastrear qué run_id ya fueron iniciados en este proceso.
+        # Permite que write_job() se llame múltiples veces en el mismo intento
+        # sin destruir outputs, pero sigue limpiando basura de intentos anteriores (crashes).
+        self._initiated_run_ids: set[str] = set()
 
     def _dir(self, run_id: str) -> Path:
         return self.root / run_id
@@ -115,26 +119,34 @@ class RunStore:
         return self.create(run_id) / "outputs"
 
     def write_job(self, run_id: str, job: Job) -> None:
-        """Escribir job.json. Se llama una única vez al iniciar un intento.
+        """Escribir job.json. Se puede llamar múltiples veces en el mismo intento.
 
-        Aquí se:
-        - Limpian restos de intentos fallidos anteriores (outputs viejos)
+        La primera llamada para un run_id en este proceso:
+        - Limpia restos de intentos anteriores fallidos (outputs viejos)
         - Marca que este intento está en progreso (.in-progress)
+
+        Llamadas posteriores (dentro del mismo intento):
+        - No limpian nada (es el mismo intento, no basura vieja)
+        - Solo actualizan job.json
         """
         base = self.create(run_id)
         in_progress_marker = base / ".in-progress"
 
-        # Si el marcador existe, es un reintento sobre una corrida anterior fallida o exitosa.
-        # Limpiar outputs viejos y eliminar el marcador antiguo.
-        if in_progress_marker.is_file():
-            outputs = base / "outputs"
-            if outputs.exists():
-                for file in outputs.iterdir():
-                    if file.is_file():
-                        file.unlink()
-            in_progress_marker.unlink()
+        # Si es la primera vez que escribimos este run_id en este proceso
+        # (el run_id no está en _initiated_run_ids), es un reintento sobre basura vieja.
+        # Limpiar y eliminar marcador antiguo.
+        if run_id not in self._initiated_run_ids:
+            if in_progress_marker.is_file():
+                outputs = base / "outputs"
+                if outputs.exists():
+                    for file in outputs.iterdir():
+                        if file.is_file():
+                            file.unlink()
+                in_progress_marker.unlink()
+            # Marcar este run_id como iniciado en este proceso
+            self._initiated_run_ids.add(run_id)
 
-        # Escribir job.json y crear nuevo marcador de "en progreso"
+        # Escribir job.json y crear/recrear marcador de "en progreso"
         (base / "job.json").write_text(job.model_dump_json(indent=2))
         in_progress_marker.touch()
 

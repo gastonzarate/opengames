@@ -140,29 +140,34 @@ def test_load_artifacts_on_nonexistent_run_raises(tmp_path, spec, image):
 
 
 def test_retry_cleans_old_outputs_from_failed_run(tmp_path, spec, image):
-    """Reintento sobre run_id que crasheó a mitad limpia outputs parciales."""
-    store = RunStore(tmp_path / "runs")
+    """Reintento sobre run_id que crasheó a mitad limpia outputs parciales.
+
+    Usa dos instancias de RunStore para simular un nuevo proceso (crash → reintento).
+    """
     job = Job(model="toy", inputs={"image": image})
     run_id = compute_run_id(job, spec)
 
-    # Simular una corrida que crashea después de escribir un output parcial
-    store.create(run_id)
-    store.write_job(run_id, job)  # Crea el marcador .in-progress
-    (store.outputs_dir(run_id) / "partial_output.glb").write_bytes(b"incomplete")
+    # Primer proceso: simular una corrida que crashea después de escribir un output parcial
+    store1 = RunStore(tmp_path / "runs")
+    store1.create(run_id)
+    store1.write_job(run_id, job)  # Crea el marcador .in-progress
+    (store1.outputs_dir(run_id) / "partial_output.glb").write_bytes(b"incomplete")
     # La corrida nunca llegó a write_metrics(), así que .in-progress sigue presente
 
-    assert not store.exists(run_id)  # No cacheada (crash)
+    assert not store1.exists(run_id)  # No cacheada (crash)
+    assert (store1._dir(run_id) / "outputs" / "partial_output.glb").exists()
 
-    # Reintento: write_job() limpia outputs viejos y re-crea el marcador
-    store.write_job(run_id, job)
-    assert not (store._dir(run_id) / "outputs" / "partial_output.glb").exists()
+    # Nuevo proceso (reintento): write_job() limpia outputs viejos del crash
+    store2 = RunStore(tmp_path / "runs")  # Nueva instancia, _initiated_run_ids vacío
+    store2.write_job(run_id, job)
+    assert not (store2._dir(run_id) / "outputs" / "partial_output.glb").exists()
 
     # Escribir nuevos outputs
-    (store.outputs_dir(run_id) / "new_output.glb").write_bytes(b"new")
-    store.write_metrics(run_id, {"duration_s": 1.0})
+    (store2.outputs_dir(run_id) / "new_output.glb").write_bytes(b"new")
+    store2.write_metrics(run_id, {"duration_s": 1.0})
 
     # Verificar que solo existe el nuevo output, no los restos del crash
-    artifacts = store.load_artifacts(run_id)
+    artifacts = store2.load_artifacts(run_id)
     assert "new_output.glb" in artifacts.files
     assert "partial_output.glb" not in artifacts.files
     assert artifacts.metrics["duration_s"] == 1.0
@@ -216,3 +221,70 @@ def test_completed_run_survives_outputs_dir_access(tmp_path, spec, image):
     assert store.exists(run_id)
     assert (outputs_path / "sample.glb").exists()
     assert (outputs_path / "sample.glb").read_bytes() == b"artefacto"
+
+
+def test_write_job_called_twice_in_same_attempt_preserves_outputs(tmp_path, spec, image):
+    """write_job() llamado dos veces en el mismo intento no destruye outputs."""
+    store = RunStore(tmp_path / "runs")
+    job = Job(model="toy", inputs={"image": image})
+    run_id = compute_run_id(job, spec)
+
+    # Primera llamada a write_job()
+    store.create(run_id)
+    store.write_job(run_id, job)
+
+    # Escribir outputs después de la primera write_job()
+    (store.outputs_dir(run_id) / "output1.glb").write_bytes(b"output1")
+
+    # Segunda llamada a write_job() (ej: wrapper de reintento, reescribir job.json)
+    store.write_job(run_id, job)
+
+    # Los outputs deben sobrevivir a la segunda write_job()
+    assert (store._dir(run_id) / "outputs" / "output1.glb").exists()
+    assert (store._dir(run_id) / "outputs" / "output1.glb").read_bytes() == b"output1"
+
+    # Escribir más outputs después de la segunda write_job()
+    (store.outputs_dir(run_id) / "output2.glb").write_bytes(b"output2")
+
+    # Completar la corrida
+    store.write_metrics(run_id, {"duration_s": 1.0})
+
+    # Verificar que ambos outputs existen
+    artifacts = store.load_artifacts(run_id)
+    assert "output1.glb" in artifacts.files
+    assert "output2.glb" in artifacts.files
+    assert artifacts.metrics["duration_s"] == 1.0
+
+
+def test_write_job_twice_after_crash_cleans_old_outputs_on_new_process(tmp_path, spec, image):
+    """Crash y reintento en nuevo proceso: write_job() limpia basura del intento anterior."""
+    # Primer proceso: simular crash
+    store1 = RunStore(tmp_path / "runs")
+    job = Job(model="toy", inputs={"image": image})
+    run_id = compute_run_id(job, spec)
+
+    store1.create(run_id)
+    store1.write_job(run_id, job)
+    (store1.outputs_dir(run_id) / "partial.glb").write_bytes(b"incomplete")
+    # Crash: nunca llegamos a write_metrics()
+
+    # Verificar que no está cacheado
+    assert not store1.exists(run_id)
+    assert (store1._dir(run_id) / "outputs" / "partial.glb").exists()
+
+    # Nuevo proceso: reintento
+    store2 = RunStore(tmp_path / "runs")  # Nueva instancia, _initiated_run_ids vacío
+
+    # Primera write_job() en el nuevo proceso ve la basura del crash anterior
+    # y la limpia
+    store2.write_job(run_id, job)
+    assert not (store2._dir(run_id) / "outputs" / "partial.glb").exists()
+
+    # Escribir outputs limpios
+    (store2.outputs_dir(run_id) / "clean.glb").write_bytes(b"clean")
+    store2.write_metrics(run_id, {"duration_s": 1.0})
+
+    # Verificar que solo existe el output limpio
+    artifacts = store2.load_artifacts(run_id)
+    assert "clean.glb" in artifacts.files
+    assert "partial.glb" not in artifacts.files
