@@ -18,6 +18,13 @@ class GenerationFailed(RuntimeError):
     """El backend reportó estado FAILED."""
 
 
+# Piso de espera entre polls. Con poll_interval=0.0 (el default) esto evita
+# que el bucle de `poll()` se convierta en un busy-loop a 100% de CPU si un
+# backend real queda atascado en RUNNING. Cuando el llamador pasa un
+# poll_interval mayor, se respeta ese valor en su lugar.
+_MIN_POLL_INTERVAL = 0.01
+
+
 @dataclass
 class RunResult:
     run_id: str
@@ -48,15 +55,39 @@ def execute(
     store.create(run_id)
     store.write_job(run_id, job)
     store.write_provenance(run_id, collect_provenance(job, spec, caps.name))
+
+    # Detectar colisiones de basename antes de copiar nada: dos inputs con
+    # claves distintas pero el mismo nombre de archivo se pisarían en
+    # silencio, y job.json/provenance.json quedarían diciendo que hubo dos
+    # inputs cuando en disco quedó uno solo. Mismo criterio que
+    # LocalBackend.fetch() usa para los outputs.
+    basenames: dict[str, list[str]] = {}
+    for name, source in job.inputs.items():
+        basenames.setdefault(source.name, []).append(name)
+    collisions = {bn: keys for bn, keys in basenames.items() if len(keys) > 1}
+    if collisions:
+        collision_msg = "; ".join(
+            f"{bn} ({', '.join(sorted(keys))})" for bn, keys in sorted(collisions.items())
+        )
+        raise ValueError(
+            f"Job input basename collisions detected: {collision_msg}. "
+            f"Multiple inputs cannot share the same filename."
+        )
     for name, source in job.inputs.items():
         shutil.copy2(source, store.inputs_dir(run_id) / source.name)
 
-    handle = backend.submit(job)
+    # `handle` arranca en None: si `submit()` lanza antes de devolver nada
+    # (por ejemplo un backend real que aprovisiona un recurso pago a medias
+    # y después falla), no hay nada que pasarle a `teardown()`. Mantener
+    # `submit()` dentro del try garantiza que el `finally` corra siempre;
+    # el guard de abajo evita llamar `teardown(None)`, que explotaría contra
+    # cualquier implementación real que espere un RunHandle de verdad.
+    handle = None
     try:
+        handle = backend.submit(job)
         status = backend.poll(handle)
         while not status.is_terminal:
-            if poll_interval:
-                time.sleep(poll_interval)
+            time.sleep(max(poll_interval, _MIN_POLL_INTERVAL))
             status = backend.poll(handle)
 
         if status is RunStatus.FAILED:
@@ -66,6 +97,7 @@ def execute(
         artifacts = backend.fetch(handle, store.outputs_dir(run_id))
         store.write_metrics(run_id, artifacts.metrics)
     finally:
-        backend.teardown(handle)
+        if handle is not None:
+            backend.teardown(handle)
 
     return RunResult(run_id=run_id, artifacts=artifacts, cached=False)

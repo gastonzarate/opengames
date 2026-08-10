@@ -162,3 +162,90 @@ def test_failed_run_is_not_cached(tmp_path):
     for _ in range(2):
         with pytest.raises(GenerationFailed):
             execute(job, LocalBackend(workroot=tmp_path / "w"), store)
+
+
+def test_duplicate_input_basenames_are_rejected_before_copying(tmp_path):
+    from backends.local import LocalBackend
+    from core.registry import get_model
+    from core.runner import execute
+    from core.runstore import compute_run_id
+
+    front = tmp_path / "a" / "photo.jpg"
+    side = tmp_path / "b" / "photo.jpg"
+    front.parent.mkdir(parents=True)
+    side.parent.mkdir(parents=True)
+    front.write_bytes(b"front")
+    side.write_bytes(b"side")
+
+    job = Job(model="mock", inputs={"front": front, "side": side})
+    store = RunStore(tmp_path / "runs")
+
+    with pytest.raises(ValueError) as err:
+        execute(job, LocalBackend(workroot=tmp_path / "w"), store)
+
+    message = str(err.value)
+    assert "photo.jpg" in message
+    assert "front" in message and "side" in message
+
+    run_id = compute_run_id(job, get_model("mock").describe())
+    assert list(store.inputs_dir(run_id).iterdir()) == []
+
+
+def test_poll_loop_retries_while_running_before_reaching_terminal_state(tmp_path):
+    from core.backend import BackendSpec
+    from core.job import Artifacts, RunHandle, RunStatus
+    from core.runner import execute
+
+    class EventuallyDone:
+        def __init__(self):
+            self.polls = 0
+
+        def capabilities(self):
+            return BackendSpec(name="eventually", vram_gb=0, ephemeral=False)
+
+        def submit(self, job):
+            return RunHandle(backend="eventually", run_id="y")
+
+        def poll(self, handle):
+            self.polls += 1
+            return RunStatus.RUNNING if self.polls < 3 else RunStatus.SUCCEEDED
+
+        def fetch(self, handle, dest):
+            return Artifacts()
+
+        def teardown(self, handle):
+            pass
+
+    backend = EventuallyDone()
+    result = execute(Job(model="mock"), backend, RunStore(tmp_path / "runs"))
+
+    assert backend.polls == 3
+    assert result.cached is False
+
+
+def test_submit_failure_propagates_without_calling_teardown_or_crashing(tmp_path):
+    from core.backend import BackendSpec
+    from core.runner import execute
+
+    teardown_calls = []
+
+    class ExplodesOnSubmit:
+        def capabilities(self):
+            return BackendSpec(name="explodes", vram_gb=0, ephemeral=True)
+
+        def submit(self, job):
+            raise RuntimeError("provisioning falló a mitad de camino")
+
+        def poll(self, handle):
+            raise AssertionError("no debería llamarse")
+
+        def fetch(self, handle, dest):
+            raise AssertionError("no debería llamarse")
+
+        def teardown(self, handle):
+            teardown_calls.append(handle)
+
+    with pytest.raises(RuntimeError, match="provisioning"):
+        execute(Job(model="mock"), ExplodesOnSubmit(), RunStore(tmp_path / "runs"))
+
+    assert teardown_calls == []
