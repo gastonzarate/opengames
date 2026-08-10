@@ -70,8 +70,8 @@ def execute(
             f"{bn} ({', '.join(sorted(keys))})" for bn, keys in sorted(collisions.items())
         )
         raise ValueError(
-            f"Job input basename collisions detected: {collision_msg}. "
-            f"Multiple inputs cannot share the same filename."
+            f"Colisión de nombres de archivo entre los inputs del job: {collision_msg}. "
+            f"Varios inputs no pueden compartir el mismo nombre de archivo."
         )
     for name, source in job.inputs.items():
         shutil.copy2(source, store.inputs_dir(run_id) / source.name)
@@ -95,6 +95,11 @@ def execute(
             raise GenerationFailed(f"La corrida {run_id} falló. {detail}".strip())
 
         artifacts = backend.fetch(handle, store.outputs_dir(run_id))
+        # El manifiesto de claves lógicas se persiste antes que las métricas:
+        # así, si el proceso muere entre las dos escrituras, el marcador
+        # `.in-progress` sigue presente y la corrida no queda cacheada a
+        # medias (ver `RunStore.exists()`).
+        store.write_artifacts(run_id, artifacts.files)
         store.write_metrics(run_id, artifacts.metrics)
     finally:
         if handle is not None:

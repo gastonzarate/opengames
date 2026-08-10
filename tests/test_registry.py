@@ -48,6 +48,20 @@ def test_unknown_model_lists_the_alternatives():
     assert "toy" in str(err.value)
 
 
+def test_unknown_component_message_has_no_spurious_quotes():
+    """`UnknownComponent` hereda de `KeyError`, cuyo `__str__` por defecto
+    hace `repr()` del argumento y le agrega comillas espurias alrededor de
+    todo el mensaje. Este es el camino de error más común del CLI (un
+    nombre mal escrito en el YAML), así que el mensaje tiene que salir
+    limpio, sin comillas envolventes."""
+    with pytest.raises(registry.UnknownComponent) as err:
+        registry.get_model("inexistente")
+    mensaje = str(err.value)
+    assert mensaje == "No existe el modelo 'inexistente'. Registrados: ninguno"
+    assert not mensaje.startswith('"')
+    assert not mensaje.endswith('"')
+
+
 def test_duplicate_registration_is_rejected():
     _make_adapter()
     with pytest.raises(ValueError):

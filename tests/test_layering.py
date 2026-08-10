@@ -35,9 +35,9 @@ _MODELS_PATHS = sorted((ROOT / "models").rglob("*.py"))
 _BACKENDS_PATHS = sorted((ROOT / "backends").rglob("*.py"))
 _CORE_PATHS = sorted((ROOT / "core").rglob("*.py"))
 
-assert _MODELS_PATHS, "No .py files found in models/ — directory may be missing or empty"
-assert _BACKENDS_PATHS, "No .py files found in backends/ — directory may be missing or empty"
-assert _CORE_PATHS, "No .py files found in core/ — directory may be missing or empty"
+assert _MODELS_PATHS, "No se encontraron archivos .py en models/: el directorio puede faltar o estar vacío"
+assert _BACKENDS_PATHS, "No se encontraron archivos .py en backends/: el directorio puede faltar o estar vacío"
+assert _CORE_PATHS, "No se encontraron archivos .py en core/: el directorio puede faltar o estar vacío"
 
 
 def _imported_roots(path: Path) -> set[str]:

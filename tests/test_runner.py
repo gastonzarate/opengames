@@ -223,6 +223,99 @@ def test_poll_loop_retries_while_running_before_reaching_terminal_state(tmp_path
     assert result.cached is False
 
 
+def test_cached_run_preserves_logical_artifact_keys(tmp_path):
+    """Las claves de `Artifacts.files` tienen que ser idénticas entre una
+    corrida fresca y la misma corrida cacheada. Con el modelo simulado la
+    clave lógica coincide con el nombre de archivo (`sample.glb`) y el bug
+    queda invisible; este adapter usa claves ("mesh", "preview") distintas
+    de los nombres de archivo que produce ("model.glb", "render.mp4") para
+    que la discrepancia, si existe, no se pueda esconder."""
+    from core.job import Artifacts
+    from core.model import Modality, ModelSpec
+    from core.runner import execute
+    from backends.local import LocalBackend
+
+    @registry.register_model("dual-key")
+    class DualKeyAdapter:
+        def describe(self):
+            return ModelSpec(
+                name="dual-key",
+                revision="0",
+                min_vram_gb=0,
+                accepts=[Modality.IMAGE],
+                produces=["glb", "mp4"],
+                docker_image="dual-key:0",
+            )
+
+        def load(self):
+            pass
+
+        def generate(self, job, workdir):
+            mesh = workdir / "model.glb"
+            preview = workdir / "render.mp4"
+            mesh.write_bytes(b"contenido-mesh")
+            preview.write_bytes(b"contenido-preview")
+            return Artifacts(
+                files={"mesh": mesh, "preview": preview},
+                metrics={"duration_s": 0.1},
+            )
+
+    store = RunStore(tmp_path / "runs")
+    job = Job(model="dual-key")
+
+    first = execute(job, LocalBackend(workroot=tmp_path / "w"), store)
+    second = execute(job, LocalBackend(workroot=tmp_path / "w"), store)
+
+    assert first.cached is False
+    assert second.cached is True
+    assert set(first.artifacts.files) == {"mesh", "preview"}
+    assert set(second.artifacts.files) == {"mesh", "preview"}
+    assert second.artifacts.files["mesh"].read_bytes() == b"contenido-mesh"
+    assert second.artifacts.files["preview"].read_bytes() == b"contenido-preview"
+
+
+def test_run_with_no_output_files_is_not_cached(tmp_path):
+    """Un backend que reporta éxito sin producir ningún archivo no puede
+    envenenar la caché para siempre: `exists()` tiene que seguir dando
+    falso, y una segunda `execute()` sobre el mismo job tiene que volver a
+    ejecutar en vez de servir el "éxito vacío" cacheado."""
+    from core.backend import BackendSpec
+    from core.job import Artifacts, RunHandle, RunStatus
+    from core.runner import execute
+
+    class NoFiles:
+        def __init__(self):
+            self.submits = 0
+
+        def capabilities(self):
+            return BackendSpec(name="nofiles", vram_gb=0, ephemeral=False)
+
+        def submit(self, job):
+            self.submits += 1
+            return RunHandle(backend="nofiles", run_id="sin-archivos")
+
+        def poll(self, handle):
+            return RunStatus.SUCCEEDED
+
+        def fetch(self, handle, dest):
+            return Artifacts()  # éxito, pero sin ningún archivo
+
+        def teardown(self, handle):
+            pass
+
+    backend = NoFiles()
+    store = RunStore(tmp_path / "runs")
+    job = Job(model="mock")
+
+    first = execute(job, backend, store)
+    assert first.cached is False
+    assert not store.exists(first.run_id)
+
+    second = execute(job, backend, store)
+    assert second.cached is False
+    assert backend.submits == 2
+
+
 def test_submit_failure_propagates_without_calling_teardown_or_crashing(tmp_path):
     from core.backend import BackendSpec
     from core.runner import execute

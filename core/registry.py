@@ -12,7 +12,17 @@ _BACKENDS: dict[str, type] = {}
 
 
 class UnknownComponent(KeyError):
-    """El nombre del config no corresponde a nada registrado."""
+    """El nombre del config no corresponde a nada registrado.
+
+    Hereda de `KeyError`, cuyo `__str__` hace `repr()` del primer argumento
+    -por eso, sin este override, el mensaje le llega al usuario entre
+    comillas espurias: `Error: "No existe el modelo 'x'. Registrados: y"`.
+    Es el camino de error más frecuente del CLI (un nombre mal escrito en
+    el YAML), así que el mensaje tiene que salir limpio.
+    """
+
+    def __str__(self) -> str:
+        return str(self.args[0]) if self.args else super().__str__()
 
 
 def _register(store: dict[str, type], kind: str, name: str) -> Callable[[type[T]], type[T]]:

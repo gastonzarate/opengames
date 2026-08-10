@@ -119,7 +119,7 @@ def test_fetch_detects_basename_collisions(tmp_path):
     dest = tmp_path / "out"
     with pytest.raises(ValueError) as exc_info:
         backend.fetch(handle, dest)
-    assert "basename collisions" in str(exc_info.value).lower()
+    assert "colisión de nombres de archivo" in str(exc_info.value).lower()
     assert "render.glb" in str(exc_info.value)
     assert "front" in str(exc_info.value)
     assert "back" in str(exc_info.value)
@@ -135,5 +135,5 @@ def test_fetch_after_teardown_fails_clearly(tmp_path):
     dest = tmp_path / "out"
     with pytest.raises(RuntimeError) as exc_info:
         backend.fetch(handle, dest)
-    assert "torn down" in str(exc_info.value).lower()
-    assert "no longer available" in str(exc_info.value).lower()
+    assert "desmontada" in str(exc_info.value).lower()
+    assert "no está disponible" in str(exc_info.value).lower()

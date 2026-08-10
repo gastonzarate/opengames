@@ -79,6 +79,7 @@ import json
 import os
 import shutil
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -145,10 +146,23 @@ def _atomic_write_text(path: Path, text: str) -> None:
     Escribe a un temporal y recién después reemplaza atómicamente con
     `os.replace()`. Un lector concurrente ve el contenido viejo completo o
     el nuevo completo, jamás algo a medio escribir.
+
+    El nombre del temporal incorpora el PID y un componente aleatorio para
+    que sea único por escritor. Un nombre fijo (`f"{path.name}.tmp"`) lo
+    comparten todos los escritores del mismo archivo: dos procesos
+    escribiendo el mismo `run_id` a la vez terminan pisándose el temporal
+    del otro, y `os.replace()` de uno puede fallar con `FileNotFoundError`
+    -o peor, publicar contenido a medio escribir del otro escritor bajo un
+    nombre que parece atómico. El `run_id` en sí no puede depender del azar
+    (tiene que ser determinístico por contenido), pero el temporal sí.
     """
-    temp_path = path.parent / f"{path.name}.tmp"
-    temp_path.write_text(text)
-    os.replace(str(temp_path), str(path))
+    temp_path = path.parent / f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        temp_path.write_text(text)
+        os.replace(str(temp_path), str(path))
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def _marker_owner_pid(marker: Path) -> int | None:
@@ -208,7 +222,20 @@ class RunStore:
     def exists(self, run_id: str) -> bool:
         """Verdadero solo si la corrida completó: `metrics.json` es JSON
         válido y no queda un marcador `.in-progress`, sin importar de quién
-        sea ese marcador — su sola presencia basta para decir "no cacheada"."""
+        sea ese marcador — su sola presencia basta para decir "no cacheada".
+
+        Si además hay un manifiesto de artefactos (`write_artifacts()` lo
+        escribe antes de `write_metrics()`), se verifica que los archivos
+        que declara existan de verdad en `outputs/`, y que el manifiesto no
+        esté vacío. Sin esto, un backend que "termina bien" sin producir
+        ningún archivo -un bug real, no un caso válido en este pipeline,
+        donde toda corrida exitosa produce al menos un artefacto- quedaría
+        cacheado para siempre con `outputs/` vacío. Si no hay manifiesto
+        (por ejemplo, un caller que escribe outputs/ a mano y llama
+        `write_metrics()` directo, como hacen algunos tests de este módulo),
+        se conserva el comportamiento anterior: no se exige nada sobre los
+        archivos.
+        """
         base_dir = self._dir(run_id)
         if (base_dir / _MARKER_NAME).is_file():
             return False
@@ -219,6 +246,19 @@ class RunStore:
             json.loads(metrics_path.read_text())
         except (json.JSONDecodeError, OSError):
             return False
+
+        manifest_path = base_dir / "artifacts.json"
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                return False
+            if not manifest:
+                return False
+            outputs = base_dir / "outputs"
+            for filename in manifest.values():
+                if not (outputs / filename).is_file():
+                    return False
         return True
 
     def inputs_dir(self, run_id: str) -> Path:
@@ -268,6 +308,29 @@ class RunStore:
     def write_provenance(self, run_id: str, data: dict[str, Any]) -> None:
         (self.create(run_id) / "provenance.json").write_text(json.dumps(data, indent=2))
 
+    def write_artifacts(self, run_id: str, files: dict[str, Path]) -> None:
+        """Persiste el mapa de clave lógica a nombre de archivo en `outputs/`.
+
+        La clave lógica es la que usa el adapter o el backend (p. ej.
+        `"mesh"`, `"preview"`), no necesariamente el nombre del archivo. Sin
+        este manifiesto, `load_artifacts()` solo puede reconstruir
+        `Artifacts.files` indexando por basename -indistinguible de la
+        clave lógica en el modelo simulado, donde coinciden, pero no contra
+        un adapter real con claves distintas del nombre de archivo. Eso
+        hace que una corrida fresca y la misma corrida cacheada devuelvan
+        `Artifacts.files` con claves distintas: el peor modo de falla
+        posible para quien hace `artifacts.files["mesh"]`.
+
+        Se llama antes de `write_metrics()` (ver `execute()` en
+        `core/runner.py`): así, si el proceso muere entre las dos
+        escrituras, el marcador `.in-progress` sigue presente y `exists()`
+        da falso de todos modos, sin depender del orden para la
+        atomicidad.
+        """
+        base = self.create(run_id)
+        manifest = {key: Path(path).name for key, path in files.items()}
+        _atomic_write_text(base / "artifacts.json", json.dumps(manifest, indent=2))
+
     def write_metrics(self, run_id: str, metrics: dict[str, float]) -> None:
         base = self.create(run_id)
         # Atómico: si el proceso muere a mitad de la escritura, metrics.json
@@ -280,11 +343,19 @@ class RunStore:
     def load_artifacts(self, run_id: str) -> Artifacts:
         """Lanza `FileNotFoundError` si la corrida nunca fue iniciada (no
         existe `job.json`). Para una corrida iniciada pero no completada,
-        devuelve `Artifacts` con lo que haya (potencialmente vacío)."""
+        devuelve `Artifacts` con lo que haya (potencialmente vacío).
+
+        Si `write_artifacts()` dejó un manifiesto (`artifacts.json`),
+        `Artifacts.files` se reconstruye con las mismas claves lógicas que
+        usó el adapter/backend -idénticas entre una corrida fresca y la
+        misma corrida cacheada. Sin manifiesto (corridas escritas a mano
+        sin pasar por `write_artifacts()`), se cae al comportamiento
+        anterior: indexar por nombre de archivo.
+        """
         base_dir = self._dir(run_id)
         job_path = base_dir / "job.json"
         if not job_path.is_file():
-            raise FileNotFoundError(f"Run {run_id} not found")
+            raise FileNotFoundError(f"No existe la corrida {run_id}")
 
         metrics_path = base_dir / "metrics.json"
         metrics = {}
@@ -295,8 +366,21 @@ class RunStore:
                 pass
 
         outputs = base_dir / "outputs"
+        manifest_path = base_dir / "artifacts.json"
+        manifest: dict[str, Any] | None = None
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                manifest = None
+
         files = {}
-        if outputs.is_dir():
+        if manifest is not None:
+            for key, filename in manifest.items():
+                candidate = outputs / filename
+                if candidate.is_file():
+                    files[key] = candidate
+        elif outputs.is_dir():
             files = {path.name: path for path in sorted(outputs.iterdir()) if path.is_file()}
 
         return Artifacts(files=files, metrics=metrics)

@@ -58,7 +58,9 @@ class LocalBackend:
         record = self._runs[handle.run_id]
 
         if record.torn_down:
-            raise RuntimeError(f"Run {handle.run_id} has been torn down and is no longer available")
+            raise RuntimeError(
+                f"La corrida {handle.run_id} ya fue desmontada (teardown) y no está disponible"
+            )
 
         dest = Path(dest)
         dest.mkdir(parents=True, exist_ok=True)
@@ -77,8 +79,8 @@ class LocalBackend:
                 f"{bn} ({', '.join(sorted(keys))})" for bn, keys in sorted(collisions.items())
             )
             raise ValueError(
-                f"Artifact basename collisions detected: {collision_msg}. "
-                f"Multiple artifacts cannot share the same filename in destination."
+                f"Colisión de nombres de archivo entre los artefactos: {collision_msg}. "
+                f"Varios artefactos no pueden compartir el mismo nombre de archivo en el destino."
             )
 
         copied = {}

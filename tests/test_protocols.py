@@ -65,6 +65,9 @@ def test_backend_duck_types_against_protocol():
         def poll(self, handle: RunHandle) -> RunStatus:
             return RunStatus.SUCCEEDED
 
+        def error(self, handle: RunHandle) -> str:
+            return ""
+
         def fetch(self, handle: RunHandle, dest: Path) -> Artifacts:
             return Artifacts()
 
