@@ -108,8 +108,9 @@ def test_exists_rejects_truncated_metrics(tmp_path, spec, image):
     job = Job(model="toy", inputs={"image": image})
     run_id = compute_run_id(job, spec)
 
-    # Escribir un metrics.json válido
+    # Escribir un metrics.json válido con flujo normal
     store.create(run_id)
+    store.write_job(run_id, job)
     store.write_metrics(run_id, {"duration_s": 1.5})
     assert store.exists(run_id)
 
@@ -121,8 +122,8 @@ def test_exists_rejects_truncated_metrics(tmp_path, spec, image):
     assert not store.exists(run_id)
 
 
-def test_load_artifacts_on_nonexistent_run_returns_empty(tmp_path, spec, image):
-    """load_artifacts sobre un run_id inexistente retorna Artifacts vacío sin crear dirs."""
+def test_load_artifacts_on_nonexistent_run_raises(tmp_path, spec, image):
+    """load_artifacts sobre un run_id inexistente lanza FileNotFoundError."""
     store = RunStore(tmp_path / "runs")
     job = Job(model="toy", inputs={"image": image})
     run_id = compute_run_id(job, spec)
@@ -130,37 +131,88 @@ def test_load_artifacts_on_nonexistent_run_returns_empty(tmp_path, spec, image):
     # Directorio no existe
     assert not (store._dir(run_id)).exists()
 
-    # Cargar artifacts no debe crear directorios
-    artifacts = store.load_artifacts(run_id)
+    # Cargar artifacts sobre un run_id que nunca fue iniciado debe lanzar excepción
+    with pytest.raises(FileNotFoundError):
+        store.load_artifacts(run_id)
 
-    # El directorio raíz no debe haber sido creado
+    # El directorio raíz no fue creado
     assert not (store._dir(run_id)).exists()
-    assert artifacts.metrics == {}
-    assert artifacts.files == {}
 
 
-def test_retry_cleans_old_outputs(tmp_path, spec, image):
-    """Reintento sobre run_id con corrida exitosa anterior no arrastra outputs viejos."""
+def test_retry_cleans_old_outputs_from_failed_run(tmp_path, spec, image):
+    """Reintento sobre run_id que crasheó a mitad limpia outputs parciales."""
     store = RunStore(tmp_path / "runs")
     job = Job(model="toy", inputs={"image": image})
     run_id = compute_run_id(job, spec)
 
-    # Primera corrida: escribir outputs y métricas
+    # Simular una corrida que crashea después de escribir un output parcial
     store.create(run_id)
-    (store.outputs_dir(run_id) / "old_output.glb").write_bytes(b"old")
-    store.write_metrics(run_id, {"duration_s": 1.0})
-    assert store.exists(run_id)
+    store.write_job(run_id, job)  # Crea el marcador .in-progress
+    (store.outputs_dir(run_id) / "partial_output.glb").write_bytes(b"incomplete")
+    # La corrida nunca llegó a write_metrics(), así que .in-progress sigue presente
 
-    # Reintento: create debe limpiar outputs viejos (porque ya existe metrics válido)
-    store.create(run_id)
-    assert not (store._dir(run_id) / "outputs" / "old_output.glb").exists()
+    assert not store.exists(run_id)  # No cacheada (crash)
+
+    # Reintento: write_job() limpia outputs viejos y re-crea el marcador
+    store.write_job(run_id, job)
+    assert not (store._dir(run_id) / "outputs" / "partial_output.glb").exists()
 
     # Escribir nuevos outputs
     (store.outputs_dir(run_id) / "new_output.glb").write_bytes(b"new")
-    store.write_metrics(run_id, {"duration_s": 2.0})
+    store.write_metrics(run_id, {"duration_s": 1.0})
 
-    # Verificar que solo existe el nuevo output
+    # Verificar que solo existe el nuevo output, no los restos del crash
     artifacts = store.load_artifacts(run_id)
     assert "new_output.glb" in artifacts.files
-    assert "old_output.glb" not in artifacts.files
-    assert artifacts.metrics["duration_s"] == 2.0
+    assert "partial_output.glb" not in artifacts.files
+    assert artifacts.metrics["duration_s"] == 1.0
+
+
+def test_completed_run_outputs_survive_subsequent_create(tmp_path, spec, image):
+    """Regresión Critical: una corrida completada no pierde outputs por create() posterior."""
+    store = RunStore(tmp_path / "runs")
+    job = Job(model="toy", inputs={"image": image})
+    run_id = compute_run_id(job, spec)
+
+    # Corrida completa
+    store.create(run_id)
+    store.write_job(run_id, job)
+    (store.outputs_dir(run_id) / "sample.glb").write_bytes(b"artefacto")
+    store.write_metrics(run_id, {"duration_s": 1.5})
+    assert store.exists(run_id)
+
+    # Verificar que el output existe
+    assert (store._dir(run_id) / "outputs" / "sample.glb").exists()
+    original_files = list((store._dir(run_id) / "outputs").iterdir())
+
+    # Aceso posterior (simular orquestador que llama create() para copiar output)
+    store.create(run_id)
+
+    # Los outputs deben seguir existiendo
+    assert store.exists(run_id)
+    assert (store._dir(run_id) / "outputs" / "sample.glb").exists()
+    artifacts = store.load_artifacts(run_id)
+    assert "sample.glb" in artifacts.files
+    assert list((store._dir(run_id) / "outputs").iterdir()) == original_files
+
+
+def test_completed_run_survives_outputs_dir_access(tmp_path, spec, image):
+    """Una corrida completada no pierde outputs cuando se accede a outputs_dir()."""
+    store = RunStore(tmp_path / "runs")
+    job = Job(model="toy", inputs={"image": image})
+    run_id = compute_run_id(job, spec)
+
+    # Corrida completa
+    store.create(run_id)
+    store.write_job(run_id, job)
+    (store.outputs_dir(run_id) / "sample.glb").write_bytes(b"artefacto")
+    store.write_metrics(run_id, {"duration_s": 1.5})
+    assert store.exists(run_id)
+
+    # Acceso a outputs_dir (que internamente llama create())
+    outputs_path = store.outputs_dir(run_id)
+
+    # Los outputs deben seguir existiendo
+    assert store.exists(run_id)
+    assert (outputs_path / "sample.glb").exists()
+    assert (outputs_path / "sample.glb").read_bytes() == b"artefacto"

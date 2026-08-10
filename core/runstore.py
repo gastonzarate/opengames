@@ -76,35 +76,37 @@ class RunStore:
         return self.root / run_id
 
     def create(self, run_id: str) -> Path:
+        """Crear directorios para una corrida. Solo mkdir -p, idempotente, nunca destructivo."""
         base = self._dir(run_id)
-        in_progress_marker = base / ".in-progress"
-
-        # Limpiar outputs de corridas anteriores (tanto fallidas como exitosas) en reintentos:
-        # Si existe outputs pero no existe .in-progress, es un reintento y hay archivos
-        # viejos que deben descartarse antes de la nueva corrida.
-        outputs = base / "outputs"
-        if outputs.exists() and not in_progress_marker.is_file():
-            for file in outputs.iterdir():
-                if file.is_file():
-                    file.unlink()
-
-        # Crear directorio y marcador de "en progreso"
         (base / "inputs").mkdir(parents=True, exist_ok=True)
-        outputs.mkdir(parents=True, exist_ok=True)
-        if not in_progress_marker.is_file():
-            in_progress_marker.touch()
-
+        (base / "outputs").mkdir(parents=True, exist_ok=True)
         return base
 
     def exists(self, run_id: str) -> bool:
-        metrics_path = self._dir(run_id) / "metrics.json"
+        """Una corrida existe si:
+        - metrics.json es JSON válido (indica completitud)
+        - AND .in-progress no existe (fue eliminado en write_metrics)
+
+        Así se distinguen estados:
+        - Corrida completada: metrics.json válido, sin .in-progress
+        - Corrida en progreso: .in-progress presente
+        - Corrida fallida (crash): .in-progress presente, metrics.json corrupto o ausente
+        - Corrida inexistente: ni metrics ni .in-progress
+        """
+        base_dir = self._dir(run_id)
+        metrics_path = base_dir / "metrics.json"
+        in_progress_marker = base_dir / ".in-progress"
+
+        # Debe existir metrics.json válido
         if not metrics_path.is_file():
             return False
         try:
             json.loads(metrics_path.read_text())
-            return True
         except (json.JSONDecodeError, OSError):
             return False
+
+        # AND no debe existir el marcador de "en progreso"
+        return not in_progress_marker.is_file()
 
     def inputs_dir(self, run_id: str) -> Path:
         return self.create(run_id) / "inputs"
@@ -113,7 +115,28 @@ class RunStore:
         return self.create(run_id) / "outputs"
 
     def write_job(self, run_id: str, job: Job) -> None:
-        (self.create(run_id) / "job.json").write_text(job.model_dump_json(indent=2))
+        """Escribir job.json. Se llama una única vez al iniciar un intento.
+
+        Aquí se:
+        - Limpian restos de intentos fallidos anteriores (outputs viejos)
+        - Marca que este intento está en progreso (.in-progress)
+        """
+        base = self.create(run_id)
+        in_progress_marker = base / ".in-progress"
+
+        # Si el marcador existe, es un reintento sobre una corrida anterior fallida o exitosa.
+        # Limpiar outputs viejos y eliminar el marcador antiguo.
+        if in_progress_marker.is_file():
+            outputs = base / "outputs"
+            if outputs.exists():
+                for file in outputs.iterdir():
+                    if file.is_file():
+                        file.unlink()
+            in_progress_marker.unlink()
+
+        # Escribir job.json y crear nuevo marcador de "en progreso"
+        (base / "job.json").write_text(job.model_dump_json(indent=2))
+        in_progress_marker.touch()
 
     def write_provenance(self, run_id: str, data: dict[str, Any]) -> None:
         (self.create(run_id) / "provenance.json").write_text(json.dumps(data, indent=2))
@@ -129,12 +152,32 @@ class RunStore:
         (base / ".in-progress").unlink(missing_ok=True)
 
     def load_artifacts(self, run_id: str) -> Artifacts:
+        """Cargar artefactos de una corrida.
+
+        Lanza FileNotFoundError si la corrida no fue nunca iniciada (no existe job.json).
+        Devuelve Artifacts con metrics={} y files={} vacío si la corrida no completó.
+        """
         base_dir = self._dir(run_id)
+        job_path = base_dir / "job.json"
         metrics_path = base_dir / "metrics.json"
-        metrics = json.loads(metrics_path.read_text()) if metrics_path.is_file() else {}
-        # No llamar a outputs_dir() para evitar crear directorios como efecto secundario
+
+        # Si no existe job.json, la corrida nunca fue iniciada: error
+        if not job_path.is_file():
+            raise FileNotFoundError(f"Run {run_id} not found")
+
+        # Leer metrics si existe y es válido
+        metrics = {}
+        if metrics_path.is_file():
+            try:
+                metrics = json.loads(metrics_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                # Si metrics está corrupto, devolver vacío (corrida falló)
+                pass
+
+        # Leer outputs si existen (no crear directorios)
         outputs = base_dir / "outputs"
         files = {}
         if outputs.is_dir():
             files = {path.name: path for path in sorted(outputs.iterdir()) if path.is_file()}
+
         return Artifacts(files=files, metrics=metrics)
