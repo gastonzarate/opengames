@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar dependencias
+        run: pip install -e ".[dev]"
+      - name: Correr los tests
+        run: pytest -v
+      - name: Humo de punta a punta
+        run: |
+          python cli.py list
+          python cli.py run experiments/smoke.yaml --runs-dir "$RUNNER_TEMP/runs"
+          python cli.py run experiments/smoke.yaml --runs-dir "$RUNNER_TEMP/runs"
