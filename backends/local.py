@@ -17,6 +17,7 @@ class _Run:
     workdir: Path
     artifacts: Artifacts = field(default_factory=Artifacts)
     error: str = ""
+    torn_down: bool = False
 
 
 @register_backend("local")
@@ -55,8 +56,31 @@ class LocalBackend:
 
     def fetch(self, handle: RunHandle, dest: Path) -> Artifacts:
         record = self._runs[handle.run_id]
+
+        if record.torn_down:
+            raise RuntimeError(f"Run {handle.run_id} has been torn down and is no longer available")
+
         dest = Path(dest)
         dest.mkdir(parents=True, exist_ok=True)
+
+        # Detectar colisión de basenames
+        basenames: dict[str, list[str]] = {}
+        for name, source in record.artifacts.files.items():
+            basename = Path(source).name
+            if basename not in basenames:
+                basenames[basename] = []
+            basenames[basename].append(name)
+
+        collisions = {bn: keys for bn, keys in basenames.items() if len(keys) > 1}
+        if collisions:
+            collision_msg = "; ".join(
+                f"{bn} ({', '.join(sorted(keys))})" for bn, keys in sorted(collisions.items())
+            )
+            raise ValueError(
+                f"Artifact basename collisions detected: {collision_msg}. "
+                f"Multiple artifacts cannot share the same filename in destination."
+            )
+
         copied = {}
         for name, source in record.artifacts.files.items():
             target = dest / Path(source).name
@@ -69,3 +93,4 @@ class LocalBackend:
         if record is None:
             return
         shutil.rmtree(record.workdir, ignore_errors=True)
+        record.torn_down = True
