@@ -1,9 +1,11 @@
 import json
+import os
 import subprocess
 import sys
 
 import pytest
 
+import core.runstore as runstore
 from core.job import Artifacts, Job
 from core.model import Modality, ModelSpec
 from core.runstore import RunStore, collect_provenance, compute_run_id
@@ -279,3 +281,55 @@ def test_two_instances_same_process_do_not_destroy_each_others_outputs(tmp_path,
 
     assert (a.outputs_dir(run_id) / "valioso.glb").exists()
     assert (a.outputs_dir(run_id) / "valioso.glb").read_bytes() == b"artefacto del intento en curso"
+
+
+def test_pid_liveness_check_treats_marker_as_alive_outside_posix(tmp_path, spec, image, monkeypatch):
+    """Fuera de POSIX, `os.kill(pid, 0)` no es una consulta benigna: en
+    Windows invoca `TerminateProcess` en vez de solo preguntar. Sin forma de
+    consultar sin efectos secundarios, un marcador ajeno se trata como vivo
+    y no se limpia -incluso si el PID que guarda corresponde a un proceso
+    que ya terminó de verdad."""
+    store = RunStore(tmp_path / "runs")
+    job = Job(model="toy", inputs={"image": image})
+    run_id = compute_run_id(job, spec)
+
+    base = store.create(run_id)
+    (base / "outputs" / "partial.glb").write_bytes(b"incompleto")
+    (base / ".in-progress").write_text(json.dumps({"pid": _dead_pid()}))
+
+    monkeypatch.setattr(runstore.os, "name", "nt")
+    store.write_job(run_id, job)
+
+    assert (base / "outputs" / "partial.glb").exists()
+
+
+def test_marker_rewrite_is_atomic_and_never_leaves_final_path_truncated(
+    tmp_path, spec, image, monkeypatch
+):
+    """El marcador se reescribe con el mismo patrón de temporal + os.replace()
+    que usa write_metrics(). Si esa reescritura falla a mitad de camino (aquí
+    se simula un crash justo antes del os.replace() final), el archivo en su
+    ruta definitiva tiene que seguir siendo el contenido viejo, completo y
+    parseable -nunca vacío ni truncado- para que un lector concurrente jamás
+    pueda confundir un intento vivo con basura huérfana."""
+    store = RunStore(tmp_path / "runs")
+    job = Job(model="toy", inputs={"image": image})
+    run_id = compute_run_id(job, spec)
+
+    store.write_job(run_id, job)  # primer write_job: crea el marcador
+    (store.outputs_dir(run_id) / "output1.glb").write_bytes(b"output1")
+    marker = store._dir(run_id) / ".in-progress"
+    original_marker_content = marker.read_text()
+    assert json.loads(original_marker_content)["pid"] == os.getpid()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("crash simulado a mitad de la reescritura del marcador")
+
+    monkeypatch.setattr(runstore.os, "replace", _boom)
+    with pytest.raises(RuntimeError):
+        store.write_job(run_id, job)  # segunda llamada, mismo intento: reescribe el marcador
+
+    # El marcador nunca quedó vacío ni truncado: sigue siendo el contenido
+    # completo de antes de la reescritura fallida.
+    assert marker.read_text() == original_marker_content
+    assert (store.outputs_dir(run_id) / "output1.glb").exists()

@@ -23,12 +23,55 @@ considera huérfano -y por lo tanto seguro de limpiar- únicamente si:
 
 Si el proceso dueño sigue vivo -sea porque es un intento real en curso, sea
 porque es OTRA instancia de `RunStore` en el mismo proceso que llama
-`write_job()` de nuevo- el marcador nunca se trata como basura. Esto es
-deliberadamente conservador: un reintento *secuencial dentro del mismo
-proceso* (mismo PID que el intento anterior, que nunca llegó a crashear
-realmente) no dispara la limpieza y puede dejar basura del intento previo.
-Ese residuo es el costo aceptado: cuesta algo de disco, nunca un falso
-positivo de caché ni la pérdida de un artefacto de un intento vivo.
+`write_job()` de nuevo- el marcador nunca se trata como basura.
+
+El marcador se reescribe con el mismo patrón de temporal + `os.replace()`
+que usa `write_metrics()`. Es necesario: a diferencia de las rondas
+anteriores, donde el marcador era un archivo vacío y un estado intermedio
+truncado no significaba nada, ahora lleva JSON que hay que poder parsear.
+Sin escritura atómica, un lector concurrente que cayera en la ventana entre
+truncar y escribir vería el archivo vacío, el parseo fallaría, y se
+trataría como huérfano un intento que en realidad está vivo -literalmente
+la propiedad 6 rota bajo concurrencia real en lugar de por estado en
+memoria.
+
+Por la misma razón, `os.kill(pid, 0)` solo se usa para consultar en
+plataformas POSIX. En Windows, `os.kill` con cualquier señal que no sea
+`CTRL_C_EVENT`/`CTRL_BREAK_EVENT` invoca `TerminateProcess`: `os.kill(pid, 0)`
+no consulta, **mata**, y lo hace sin lanzar ninguna excepción distinguible.
+Windows no es una plataforma soportada hoy (CI en Ubuntu, desarrollo en
+macOS), pero el costo de no blindar esto sería catastrófico y silencioso el
+día que alguien lo ejecute ahí. Fuera de POSIX, un marcador ajeno siempre se
+trata como vivo: no se limpia nada, nunca se arriesga terminar un proceso
+ni destruir un artefacto por no poder confirmar sin efectos secundarios que
+su dueño murió.
+
+## Dos residuos conocidos, aceptados por diseño
+
+Esto no es una lista de casos por resolver: es una lista de casos que se
+decidió NO resolver porque cualquier solución automática es peor que el
+problema. Quien retome este módulo debería tratarlos como decisiones
+tomadas, no como descuidos.
+
+1. **Reintento secuencial dentro del mismo proceso.** Si el "intento
+   anterior" nunca llegó a crashear de verdad -mismo proceso, mismo PID,
+   solo se está llamando `write_job()` de nuevo sobre restos que ese mismo
+   proceso dejó- el marcador se ve vivo (porque lo está) y no se limpia.
+   Deja basura de disco. Es el costo aceptado del lado seguro: nunca un
+   falso positivo de caché, nunca la pérdida de un artefacto de un intento
+   vivo, a cambio de algo de basura ocasional.
+
+2. **Reutilización de PID.** Si el sistema operativo recicla el PID que
+   quedó en un marcador huérfano y se lo asigna a otro proceso cualquiera
+   que esté vivo en el momento de la consulta, `_pid_alive()` da verdadero
+   y la limpieza se saltea: el intento nuevo escribe sus outputs junto a
+   los restos del intento que en realidad sí murió. `load_artifacts()`
+   devuelve la unión de ambos sin ninguna señal de que algo esté mal. No se
+   intenta resolver: toda alternativa considerada (guardar más contexto de
+   identidad del proceso, expirar marcadores por tiempo, bloquear
+   reintentos ante duda) o arriesga borrar datos de un intento realmente
+   vivo, o bloquea para siempre un reintento legítimo -ambas peores que
+   basura ocasional mezclada con outputs nuevos.
 """
 
 import hashlib
@@ -96,6 +139,18 @@ def collect_provenance(job: Job, spec: ModelSpec, backend_name: str) -> dict[str
     }
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Escribe `text` en `path` sin dejar nunca un estado truncado visible.
+
+    Escribe a un temporal y recién después reemplaza atómicamente con
+    `os.replace()`. Un lector concurrente ve el contenido viejo completo o
+    el nuevo completo, jamás algo a medio escribir.
+    """
+    temp_path = path.parent / f"{path.name}.tmp"
+    temp_path.write_text(text)
+    os.replace(str(temp_path), str(path))
+
+
 def _marker_owner_pid(marker: Path) -> int | None:
     """PID guardado en el marcador, o None si no se puede parsear."""
     try:
@@ -109,7 +164,17 @@ def _marker_owner_pid(marker: Path) -> int | None:
 
 
 def _pid_alive(pid: int) -> bool:
-    """True si el proceso `pid` sigue existiendo (vivo o zombie, da igual)."""
+    """True si el proceso `pid` sigue existiendo (vivo o zombie, da igual).
+
+    Solo consulta con `os.kill(pid, 0)` en POSIX. Fuera de POSIX (Windows),
+    esa misma llamada no es una consulta: `os.kill` con cualquier señal que
+    no sea `CTRL_C_EVENT`/`CTRL_BREAK_EVENT` invoca `TerminateProcess`, así
+    que "preguntar" terminaría al proceso dueño real. Sin forma de
+    consultar sin efectos secundarios, se asume vivo: nunca se limpia nada
+    fuera de POSIX por esta vía.
+    """
+    if os.name != "posix":
+        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -197,7 +262,7 @@ class RunStore:
             if owner_pid is None or not _pid_alive(owner_pid):
                 self._reset_attempt(base)
 
-        marker.write_text(json.dumps({"pid": os.getpid()}))
+        _atomic_write_text(marker, json.dumps({"pid": os.getpid()}))
         (base / "job.json").write_text(job.model_dump_json(indent=2))
 
     def write_provenance(self, run_id: str, data: dict[str, Any]) -> None:
@@ -205,13 +270,9 @@ class RunStore:
 
     def write_metrics(self, run_id: str, metrics: dict[str, float]) -> None:
         base = self.create(run_id)
-        metrics_path = base / "metrics.json"
-        temp_path = base / "metrics.json.tmp"
-        # Escribir a temporal primero, luego reemplazar atómicamente: si el
-        # proceso muere a mitad de la escritura, metrics.json nunca queda
-        # truncado.
-        temp_path.write_text(json.dumps(metrics, indent=2))
-        os.replace(str(temp_path), str(metrics_path))
+        # Atómico: si el proceso muere a mitad de la escritura, metrics.json
+        # nunca queda truncado.
+        _atomic_write_text(base / "metrics.json", json.dumps(metrics, indent=2))
         # Recién ahora, con metrics.json ya persistido, la corrida completó:
         # se borra el marcador de "en progreso".
         (base / _MARKER_NAME).unlink(missing_ok=True)
