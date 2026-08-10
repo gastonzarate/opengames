@@ -265,12 +265,23 @@ produce una tabla comparable.
 
 ## 9. Backends
 
+**Restricción que ordena esta sección: hay créditos de AWS disponibles.** Eso invierte la
+comparación de costos que sostenía la versión anterior de este spec. RunPod es más barato
+en dólares de lista —unos USD 0,34 la hora contra 1,86 de `g6e.xlarge`— pero con créditos
+el costo efectivo de AWS es cero hasta agotarlos, así que AWS va primero y RunPod queda
+como plan alternativo.
+
+Hay además una ventaja técnica que no depende de los créditos: `g6e.xlarge` monta una
+L40S de 48 GB, mientras que la RTX 4090 de RunPod tiene exactamente los 24 GB que
+TRELLIS.2 declara como mínimo. Trabajar con el doble de la memoria requerida elimina el
+riesgo de quedarse sin VRAM al subir la resolución o el tamaño de textura.
+
 | Backend | Uso | Notas |
 |---|---|---|
 | `local` | Modelos que entran en 8 GB, y desarrollo | TripoSG, PartCrafter, UniRig sobre `gaston-pc` |
-| `runpod` | Ciclo de iteración principal | El más barato. Sin trámite de cuota |
-| `ec2` | Corridas largas y por lote | Requiere aumento de cuota de instancias G, que no es inmediato |
-| `sagemaker` | Generación bajo demanda | Asynchronous Inference |
+| `ec2` | **Ciclo de iteración principal** | Cubierto por créditos. `g6e.xlarge` con L40S de 48 GB. Requiere aumento de cuota de instancias G |
+| `sagemaker` | Generación por lotes y bajo demanda | Asynchronous Inference. Escala a cero |
+| `runpod` | Plan alternativo | Si los créditos se agotan o la cuota de AWS se demora |
 
 **SageMaker:** se usa Asynchronous Inference, no endpoints en tiempo real. Los endpoints
 real-time exigen que la inferencia termine en 60 segundos y aceptan payloads de hasta 6 MB;
@@ -286,17 +297,28 @@ de varios minutos. Es irrelevante para generación por lotes y descarta el uso i
 
 ## 10. Orden de construcción
 
-1. `core` con las interfaces, el backend `local` y un adapter simulado (`models/mock.py`,
-   que devuelve un GLB fijo sin cargar pesos). Se testea completo sin GPU y sin costo.
-2. Backend `runpod`, más el adapter y el Dockerfile de TRELLIS.2, validados en conjunto.
-3. Etapa `evaluate` y el experimento de la sección 7.3.
-4. Backend de SageMaker Async.
-5. Adapters de TripoSG, PartCrafter y UniRig sobre `local`.
-6. Backend `ec2`, una vez aprobado el aumento de cuota de instancias G.
+**Paso cero, antes que todo lo demás: pedir el aumento de cuota de instancias G en AWS.**
+En cuentas nuevas suele venir en cero y la aprobación no es inmediata. Es el único ítem con
+tiempo de espera externo, así que se pide el primer día y se trabaja en paralelo mientras
+llega. Si se deja para cuando haga falta, bloquea todo el resto.
 
-El backend `ec2` va último a propósito: cubre el mismo caso que `runpod` a mayor costo y
-con un trámite de cuota de por medio. Su valor aparece cuando haya volumen sostenido o
-haga falta que todo viva dentro de la cuenta AWS.
+1. ~~`core` con las interfaces, el backend `local` y un adapter simulado.~~ **Completado**
+   el 2026-08-10: 20 commits, 71 tests, CI en verde.
+2. Backend `ec2`, más el adapter y el Dockerfile de TRELLIS.2, validados en conjunto.
+3. Etapa `evaluate` y el experimento de la sección 7.3.
+4. Backend de SageMaker Async, para lotes y para dejar de pagar GPU ociosa.
+5. Adapters de TripoSG, PartCrafter y UniRig sobre `local`.
+6. Backend `runpod`, solo si se agotan los créditos o la cuota se demora más de lo tolerable.
+
+`ec2` pasó de último a segundo por la disponibilidad de créditos (sección 9). `runpod`
+ocupa el lugar que antes tenía `ec2`: cubre el mismo caso, y su valor aparece únicamente si
+el camino de AWS se traba.
+
+**Por qué `ec2` antes que `sagemaker`, aun teniendo los dos créditos:** para las primeras
+corridas se necesita iterar sobre la compilación de las seis extensiones CUDA, y eso se
+hace mucho más rápido con acceso directo a la máquina que empaquetando un contenedor que
+cumpla el contrato de SageMaker (`/opt/ml`, `/ping`, `/invocations`). SageMaker gana cuando
+el pipeline ya funciona y lo que importa es no pagar GPU ociosa entre lotes.
 
 ## 11. Criterios de aceptación
 
