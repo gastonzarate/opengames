@@ -297,28 +297,45 @@ de varios minutos. Es irrelevante para generación por lotes y descarta el uso i
 
 ## 10. Orden de construcción
 
-**Paso cero, antes que todo lo demás: pedir el aumento de cuota de instancias G en AWS.**
-En cuentas nuevas suele venir en cero y la aprobación no es inmediata. Es el único ítem con
-tiempo de espera externo, así que se pide el primer día y se trabaja en paralelo mientras
-llega. Si se deja para cuando haga falta, bloquea todo el resto.
+### La cuota disponible decide el orden
+
+Relevamiento de la cuenta **872154182820** (perfil `macacoai`), el 2026-08-11:
+
+| Cuota | us-east-1 |
+|---|---|
+| EC2 · G y VT On-Demand | **0 vCPU** |
+| EC2 · G y VT Spot | 0 vCPU |
+| EC2 · P On-Demand y Spot | 0 vCPU |
+| SageMaker · `ml.g6e.xlarge` endpoint | 0 |
+| **SageMaker · `ml.g5.xlarge` endpoint** | **1** |
+
+Todo lo de EC2 está en cero, así que el camino cómodo está cerrado hasta que se apruebe un
+aumento. La única puerta abierta hoy es un endpoint de SageMaker sobre `ml.g5.xlarge`
+—A10G con 24 GB, exactamente el mínimo que declara TRELLIS.2—, y por decisión explícita se
+va por ahí en lugar de esperar el trámite.
+
+Eso invierte el argumento de la versión anterior de este documento, que ponía `ec2` antes
+que `sagemaker` porque iterar sobre la compilación de las seis extensiones CUDA es más
+cómodo con acceso directo a la máquina. El argumento sigue siendo válido; la cuota manda.
 
 1. ~~`core` con las interfaces, el backend `local` y un adapter simulado.~~ **Completado**
    el 2026-08-10: 20 commits, 71 tests, CI en verde.
-2. Backend `ec2`, más el adapter y el Dockerfile de TRELLIS.2, validados en conjunto.
+2. Dockerfile de TRELLIS.2 y adapter, con el backend `sagemaker` sobre Asynchronous
+   Inference en `ml.g5.xlarge`.
 3. Etapa `evaluate` y el experimento de la sección 7.3.
-4. Backend de SageMaker Async, para lotes y para dejar de pagar GPU ociosa.
-5. Adapters de TripoSG, PartCrafter y UniRig sobre `local`.
-6. Backend `runpod`, solo si se agotan los créditos o la cuota se demora más de lo tolerable.
+4. Adapters de TripoSG, PartCrafter y UniRig sobre `local`.
+5. Backend `ec2`, si en algún momento se aprueba la cuota y se quiere el ciclo de iteración
+   cómodo o instancias más grandes que la A10G.
+6. Backend `runpod`, solo si AWS deja de ser viable.
 
-`ec2` pasó de último a segundo por la disponibilidad de créditos (sección 9). `runpod`
-ocupa el lugar que antes tenía `ec2`: cubre el mismo caso, y su valor aparece únicamente si
-el camino de AWS se traba.
+**Consecuencia de trabajar sobre `ml.g5.xlarge`:** 24 GB es el mínimo exacto, no hay
+margen. Las primeras corridas van a 512³ con `texture_size=2048`, no con los valores del
+ejemplo oficial, que usa 4096 y un `decimation_target` de un millón.
 
-**Por qué `ec2` antes que `sagemaker`, aun teniendo los dos créditos:** para las primeras
-corridas se necesita iterar sobre la compilación de las seis extensiones CUDA, y eso se
-hace mucho más rápido con acceso directo a la máquina que empaquetando un contenedor que
-cumpla el contrato de SageMaker (`/opt/ml`, `/ping`, `/invocations`). SageMaker gana cuando
-el pipeline ya funciona y lo que importa es no pagar GPU ociosa entre lotes.
+**Lo que no está bloqueado por la cuota:** el Dockerfile. La compilación de `flash-attn`,
+`nvdiffrast`, `nvdiffrec`, `cumesh`, `o-voxel` y `flexgemm` desde fuente es la parte más
+riesgosa de toda la fase, y se puede validar en `gaston-pc` —que compila e importa bien con
+8 GB, aunque no pueda correr inferencia— antes de gastar un minuto de GPU paga.
 
 ## 11. Criterios de aceptación
 
