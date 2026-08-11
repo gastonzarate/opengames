@@ -15,7 +15,8 @@
 - **`ml.g5.xlarge` tiene 24 GB de VRAM, el mínimo exacto que declara TRELLIS.2.** Todas las corridas de esta fase usan `pipeline_type='512'` y `texture_size=2048`. No usar los valores del ejemplo oficial (`texture_size=4096`, `decimation_target=1000000`).
 - **`models/` no puede importar SDKs de nube.** El adapter de TRELLIS.2 va en `models/`, así que no puede importar `boto3`. El transporte es responsabilidad de `backends/sagemaker.py`.
 - **`core/` no puede importar de `models/` ni de `backends/`.** El test de capas de `tests/test_layering.py` lo verifica por AST y ya está en CI.
-- **El endpoint se configura con `MinInstanceCount=0`** para que escale a cero y no facture cuando no hay trabajo.
+- **El endpoint tiene que escalar a cero.** Un endpoint de SageMaker no lo hace solo: hay que registrar un objetivo de auto-escalado de Application Auto Scaling con `MinCapacity=0` sobre la variante. Sin eso, `InitialInstanceCount=1` deja una `ml.g5.xlarge` facturando de forma permanente.
+- **Por qué un endpoint y no un trabajo que corre y termina.** Batch Transform y los Processing Jobs encajarían mejor con generar unos assets y parar, pero en esta cuenta su cuota es cero: relevado el 2026-08-11, lo único habilitado es `ml.g5.xlarge for endpoint usage = 1`. No es una elección de diseño.
 - **Nunca escribir credenciales en código, configs ni reportes.** Las credenciales vienen del perfil de AWS; los identificadores de recursos que no son secretos (nombres de bucket, ARNs de rol) van en variables de entorno o en el config del experimento.
 - Todo lo que no requiera GPU ni AWS tiene que correr en CI.
 
@@ -1123,6 +1124,46 @@ def crear(sm, args) -> int:
     sm.create_endpoint(EndpointName=NOMBRE, EndpointConfigName=NOMBRE)
     print(f"endpoint {NOMBRE} creándose sobre {INSTANCIA}")
     print("seguí el estado con: python scripts/endpoint.py estado")
+    print("cuando esté InService, corré: python scripts/endpoint.py escalar-a-cero")
+    return 0
+
+
+def escalar_a_cero(sm, _) -> int:
+    """Registra el auto-escalado con MinCapacity=0.
+
+    Un endpoint no escala a cero por su cuenta: sin esto, InitialInstanceCount=1
+    deja una ml.g5.xlarge facturando de forma permanente. Solo se puede
+    registrar cuando el endpoint ya está InService.
+    """
+    aas = boto3.client("application-autoscaling", region_name="us-east-1")
+    recurso = f"endpoint/{NOMBRE}/variant/principal"
+
+    aas.register_scalable_target(
+        ServiceNamespace="sagemaker",
+        ResourceId=recurso,
+        ScalableDimension="sagemaker:variant:DesiredInstanceCount",
+        MinCapacity=0,
+        MaxCapacity=1,
+    )
+    aas.put_scaling_policy(
+        PolicyName=f"{NOMBRE}-por-backlog",
+        ServiceNamespace="sagemaker",
+        ResourceId=recurso,
+        ScalableDimension="sagemaker:variant:DesiredInstanceCount",
+        PolicyType="TargetTrackingScaling",
+        TargetTrackingScalingPolicyConfiguration={
+            "TargetValue": 1.0,
+            "CustomizedMetricSpecification": {
+                "MetricName": "ApproximateBacklogSizePerInstance",
+                "Namespace": "AWS/SageMaker",
+                "Dimensions": [{"Name": "EndpointName", "Value": NOMBRE}],
+                "Statistic": "Average",
+            },
+            "ScaleInCooldown": 600,
+            "ScaleOutCooldown": 60,
+        },
+    )
+    print("auto-escalado registrado: baja a 0 tras 10 minutos sin trabajo")
     return 0
 
 
@@ -1159,11 +1200,14 @@ def main() -> int:
     c.add_argument("--rol", required=True, help="ARN del rol de ejecución")
     c.add_argument("--bucket", required=True)
     sub.add_parser("estado")
+    sub.add_parser("escalar-a-cero")
     sub.add_parser("borrar")
 
     args = p.parse_args()
     sm = boto3.client("sagemaker", region_name="us-east-1")
-    return {"crear": crear, "estado": estado, "borrar": borrar}[args.cmd](sm, args)
+    acciones = {"crear": crear, "estado": estado,
+                "escalar-a-cero": escalar_a_cero, "borrar": borrar}
+    return acciones[args.cmd](sm, args)
 
 
 if __name__ == "__main__":
@@ -1226,11 +1270,25 @@ python scripts/endpoint.py estado
 
 Expected: pasa de `Creating` a `InService`. Puede tardar 15 minutos o más: SageMaker baja 11 GB de pesos y arranca el contenedor. Si queda en `Failed`, el motivo aparece en la salida y los logs están en CloudWatch, en el grupo `/aws/sagemaker/Endpoints/opengames-trellis2`.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Registrar el auto-escalado a cero**
+
+Solo se puede hacer con el endpoint ya en `InService`:
+
+```bash
+python scripts/endpoint.py escalar-a-cero
+aws application-autoscaling describe-scalable-targets \
+  --service-namespace sagemaker \
+  --resource-ids endpoint/opengames-trellis2/variant/principal \
+  --query 'ScalableTargets[0].{min:MinCapacity,max:MaxCapacity}' --output json
+```
+
+Expected: `{"min": 0, "max": 1}`. Sin esto la instancia factura las 24 horas.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add scripts/endpoint.py
-git commit -m "feat(scripts): ciclo de vida del endpoint de SageMaker Async"
+git commit -m "feat(scripts): ciclo de vida del endpoint con auto-escalado a cero"
 ```
 
 ---
